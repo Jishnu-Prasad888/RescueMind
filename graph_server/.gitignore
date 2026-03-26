@@ -1,0 +1,12 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Go
+server_bin
+rescuemind-api/server_bin
+
+# OS
+.DS_Store

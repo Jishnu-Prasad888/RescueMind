@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package routing;
+
+option go_package = "rescuemind-api/internal/routing/proto";
+
+service RoutingService {
+  rpc ComputeRoute (RouteRequest) returns (RouteResponse);
+}
+
+message RouteRequest {
+  string start = 1;
+  string end = 2;
+}
+
+message Route {
+  repeated string path = 1;
+  float distance = 2;
+  float estimated_time = 3;
+  string route_type = 4;
+}
+
+message RouteResponse {
+  repeated Route routes = 1;
+}

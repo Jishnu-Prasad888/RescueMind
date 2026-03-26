@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "RescueMind",
+    "slug": "rescuemind",
+    "scheme": "rescuemind",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": { "backgroundColor": "#060D18" },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "RescueMind needs location to find nearest emergency services and calculate routes."
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.rescuemind.app",
+      "config": {
+        "googleMaps": {
+          "apiKey": "$EXPO_PUBLIC_GOOGLE_MAPS_API_KEY"
+        }
+      },
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.rescuemind.app",
+      "config": {
+        "googleMapsApiKey": "$EXPO_PUBLIC_GOOGLE_MAPS_API_KEY"
+      },
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "RescueMind needs your location to find emergency services and calculate evacuation routes.",
+        "NSLocationAlwaysUsageDescription": "RescueMind needs your location for real-time navigation during emergencies."
+      }
+    },
+    "extra": {
+      "googleMapsApiKey": "$EXPO_PUBLIC_GOOGLE_MAPS_API_KEY"
+    }
+  }
+}
