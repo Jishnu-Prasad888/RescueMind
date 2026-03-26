@@ -151,7 +151,7 @@ Always prioritize life safety information above all else."""
         self.llm = ChatOpenAI(
             model=self.cfg.llm_model,
             temperature=0.1,
-            openai_api_key=os.environ["OPENROUTER_API_KEY"],
+            openai_api_key=os.environ["OPENROUTER_API_KEY"].strip(),
             openai_api_base="https://openrouter.ai/api/v1",
             default_headers={
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "http://localhost"),
