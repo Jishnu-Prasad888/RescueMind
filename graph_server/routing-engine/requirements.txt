@@ -1,2 +1,6 @@
 networkx
 flask
+grpcio
+grpcio-tools
+protobuf
+scipy
