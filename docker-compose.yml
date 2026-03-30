@@ -1,0 +1,41 @@
+services:
+  routing-engine:
+    build:
+      context: ./graph_server/routing-engine
+    networks:
+      - rescuemind-net
+
+  graph-api:
+    build:
+      context: ./graph_server/rescuemind-api
+    environment:
+      - GRPC_SERVER_URL=routing-engine:50051
+    depends_on:
+      - routing-engine
+    networks:
+      - rescuemind-net
+
+  rag-server:
+    build:
+      context: ./RAG_Server
+    networks:
+      - rescuemind-net
+
+  gateway:
+    build:
+      context: ./main_server
+    ports:
+      - "6000:6000"
+    environment:
+      - PORT=6000
+      - RAG_SERVER_URL=http://rag-server:8000
+      - GRAPH_API_URL=http://graph-api:8080
+    depends_on:
+      - graph-api
+      - rag-server
+    networks:
+      - rescuemind-net
+
+networks:
+  rescuemind-net:
+    driver: bridge
