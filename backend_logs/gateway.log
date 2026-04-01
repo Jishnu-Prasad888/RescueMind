@@ -1,0 +1,4 @@
+Gateway running on port 6000
+RAG target: http://localhost:8000
+Graph target: http://localhost:8080
+signal: interrupt

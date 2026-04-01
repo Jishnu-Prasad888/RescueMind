@@ -1,0 +1,3 @@
+INFO:root:Initializing Routing Service and loading graph...
+INFO:root:Graph loaded successfully.
+INFO:root:Server started, listening on 50051

@@ -4,12 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,17 +21,6 @@ type Location struct {
 type Response struct {
 	NearestLocation string  `json:"nearest_location"`
 	DistanceKM      float64 `json:"distance_km"`
-}
-
-type proxyTarget struct {
-	Name string
-	URL  *url.URL
-}
-
-type gatewayConfig struct {
-	Port      string
-	RAGTarget proxyTarget
-	GraphAPI  proxyTarget
 }
 
 func haversine(lat1, lon1, lat2, lon2 float64) float64 {
@@ -86,43 +72,6 @@ func loadLocations(filename string) ([]Location, error) {
 	return locations, scanner.Err()
 }
 
-func mustParseURL(name, raw string) *url.URL {
-	u, err := url.Parse(raw)
-	if err != nil {
-		log.Fatalf("invalid %s URL %q: %v", name, raw, err)
-	}
-	return u
-}
-
-func buildConfig() gatewayConfig {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "6000"
-	}
-
-	ragURL := os.Getenv("RAG_SERVER_URL")
-	if ragURL == "" {
-		ragURL = "http://localhost:8000"
-	}
-
-	graphURL := os.Getenv("GRAPH_API_URL")
-	if graphURL == "" {
-		graphURL = "http://localhost:8080"
-	}
-
-	return gatewayConfig{
-		Port: port,
-		RAGTarget: proxyTarget{
-			Name: "rag",
-			URL:  mustParseURL("RAG_SERVER_URL", ragURL),
-		},
-		GraphAPI: proxyTarget{
-			Name: "graph",
-			URL:  mustParseURL("GRAPH_API_URL", graphURL),
-		},
-	}
-}
-
 func nearestHandler(w http.ResponseWriter, r *http.Request) {
 	latStr := r.URL.Query().Get("lat")
 	lonStr := r.URL.Query().Get("lon")
@@ -166,83 +115,12 @@ func nearestHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func attachProxy(prefix string, target proxyTarget, mux *http.ServeMux) {
-	proxy := httputil.NewSingleHostReverseProxy(target.URL)
-	originalDirector := proxy.Director
-
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		// Strip the gateway prefix before forwarding.
-		req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
-		if req.URL.Path == "" {
-			req.URL.Path = "/"
-		}
-		req.Host = target.URL.Host
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	status := map[string]string{
+		"gateway": "up",
 	}
-
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "upstream_unreachable",
-			"service": target.Name,
-			"detail":  err.Error(),
-		})
-	}
-
-	mux.Handle(prefix+"/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxy.ServeHTTP(w, r)
-	}))
-}
-
-func healthProbe(url string) string {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "down"
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		return "up"
-	}
-	return "degraded"
-}
-
-func gatewayHealthHandler(cfg gatewayConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		status := map[string]string{
-			"gateway": "up",
-			"rag":     healthProbe(cfg.RAGTarget.URL.String() + "/health"),
-			"graph":   healthProbe(cfg.GraphAPI.URL.String() + "/health"),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(status)
-	}
-}
-
-func main() {
-	cfg := buildConfig()
-	mux := http.NewServeMux()
-
-	// Native endpoint from main_server.
-	mux.HandleFunc("/nearest", nearestHandler)
-	mux.HandleFunc("/health", gatewayHealthHandler(cfg))
-
-	// Proxy all RAG Server endpoints under /rag/*
-	// Example: /rag/query -> {RAG_SERVER_URL}/query
-	attachProxy("/rag", cfg.RAGTarget, mux)
-
-	// Proxy all Graph API endpoints under /graph/*
-	// Example: /graph/route -> {GRAPH_API_URL}/route
-	attachProxy("/graph", cfg.GraphAPI, mux)
-
-	handler := withCORS(mux)
-
-	fmt.Printf("Gateway running on port %s\n", cfg.Port)
-	fmt.Printf("RAG target: %s\n", cfg.RAGTarget.URL.String())
-	fmt.Printf("Graph target: %s\n", cfg.GraphAPI.URL.String())
-
-	log.Fatal(http.ListenAndServe(":"+cfg.Port, handler))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -256,4 +134,20 @@ func withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "6000"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nearest", nearestHandler)
+	mux.HandleFunc("/health", healthHandler)
+
+	handler := withCORS(mux)
+
+	fmt.Printf("Gateway running on port %s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
