@@ -20,6 +20,7 @@ import {
   Animated,
   Dimensions,
   StatusBar,
+  Linking,
 } from "react-native";
 import {
   SafeAreaProvider,
@@ -310,46 +311,104 @@ async function incrementGoogleApiRequestCounter(): Promise<number> {
 
 /* ───────────────── GOOGLE DIRECTIONS ───────────────── */
 
-async function fetchGoogleDirections(
+function mapGoogleRoutePayload(r: any, i: number): GoogleRoute {
+  const leg = r.legs[0];
+  const durationTrafficS =
+    typeof leg.duration_in_traffic?.value === "number"
+      ? leg.duration_in_traffic.value
+      : leg.duration.value;
+
+  return {
+    index: i,
+    summary: r.summary,
+    distance: leg.distance.text,
+    duration: leg.duration_in_traffic?.text ?? leg.duration.text,
+    distanceM: leg.distance.value,
+    durationS: durationTrafficS,
+    polyline: decodePolyline(r.overview_polyline.points),
+    steps: leg.steps.map(
+      (s: any): Step => ({
+        instruction: s.html_instructions.replace(/<[^>]*>/g, ""),
+        distance: s.distance.text,
+        duration: s.duration.text,
+        maneuver: s.maneuver,
+        startLat: s.start_location.lat,
+        startLng: s.start_location.lng,
+      }),
+    ),
+  };
+}
+
+/**
+ * Turn-by-turn directions aligned with the active route tab:
+ * FASTEST — traffic-aware alternatives, pick shortest ETA
+ * SAFEST — avoid highways (calmer roads)
+ * SHORTEST — alternatives, pick minimum distance
+ */
+async function fetchGoogleDirectionsForMode(
   origin: Coord,
   destination: Coord,
-): Promise<GoogleRoute[]> {
+  mode: ServerRoute["type"],
+): Promise<GoogleRoute> {
   await assertGoogleApiCallAllowed();
 
-  const url =
+  const dest = `${destination.latitude},${destination.longitude}`;
+  const org = `${origin.latitude},${origin.longitude}`;
+
+  let url =
     `https://maps.googleapis.com/maps/api/directions/json` +
-    `?origin=${origin.latitude},${origin.longitude}` +
-    `&destination=${destination.latitude},${destination.longitude}` +
-    `&alternatives=true` +
+    `?origin=${org}` +
+    `&destination=${dest}` +
     `&key=${GMAPS_KEY}`;
+
+  if (mode === "FASTEST") {
+    url +=
+      `&alternatives=true` +
+      `&departure_time=now` +
+      `&traffic_model=best_guess`;
+  } else if (mode === "SAFEST") {
+    url += `&avoid=highways`;
+  } else {
+    url += `&alternatives=true`;
+  }
 
   const res = await fetch(url);
   const data = await res.json();
   await incrementGoogleApiRequestCounter();
 
-  if (data.status !== "OK") throw new Error(data.status);
+  if (data.status !== "OK") {
+    throw new Error(
+      `Directions: ${data.status}${data.error_message ? ` — ${data.error_message}` : ""}`,
+    );
+  }
 
-  return data.routes.map(
-    (r: any, i: number): GoogleRoute => ({
-      index: i,
-      summary: r.summary,
-      distance: r.legs[0].distance.text,
-      duration: r.legs[0].duration.text,
-      distanceM: r.legs[0].distance.value,
-      durationS: r.legs[0].duration.value,
-      polyline: decodePolyline(r.overview_polyline.points),
-      steps: r.legs[0].steps.map(
-        (s: any): Step => ({
-          instruction: s.html_instructions.replace(/<[^>]*>/g, ""),
-          distance: s.distance.text,
-          duration: s.duration.text,
-          maneuver: s.maneuver,
-          startLat: s.start_location.lat,
-          startLng: s.start_location.lng,
-        }),
-      ),
-    }),
+  const mapped: GoogleRoute[] = data.routes.map((r: any, i: number) =>
+    mapGoogleRoutePayload(r, i),
   );
+
+  if (mapped.length === 0) {
+    throw new Error("Directions: no routes returned");
+  }
+
+  if (mapped.length === 1) return mapped[0];
+
+  if (mode === "FASTEST") {
+    return mapped.reduce((a, b) => (a.durationS <= b.durationS ? a : b));
+  }
+  if (mode === "SHORTEST") {
+    return mapped.reduce((a, b) => (a.distanceM <= b.distanceM ? a : b));
+  }
+  return mapped[0];
+}
+
+function openDirectionsInGoogleMaps(origin: Coord, destination: Coord): void {
+  const o = `${origin.latitude},${origin.longitude}`;
+  const d = `${destination.latitude},${destination.longitude}`;
+  const q = `api=1&origin=${encodeURIComponent(o)}&destination=${encodeURIComponent(d)}&travelmode=driving`;
+  const url = `https://www.google.com/maps/dir/?${q}`;
+  Linking.openURL(url).catch(() => {
+    Alert.alert("Could not open maps", "No app available to handle the link.");
+  });
 }
 
 /* ───────────────── ROUTE COLORS ───────────────── */
@@ -560,7 +619,7 @@ function RAGScreen() {
 /* ───────────────── ROUTE SCREEN ───────────────── */
 
 function RouteScreen() {
-  const { location, baseURL } = useApp();
+  const { location, baseURL, googleApiBlocked } = useApp();
   const mapRef = useRef<MapView>(null);
 
   const [nearest, setNearest] = useState<NearestLocation | null>(null);
@@ -570,14 +629,17 @@ function RouteScreen() {
   const [loadingNearest, setLoadingNearest] = useState(false);
   const [loadingRoutes, setLoadingRoutes] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [directionsByType, setDirectionsByType] = useState<
+    Partial<Record<ServerRoute["type"], GoogleRoute>>
+  >({});
+  const [loadingDirections, setLoadingDirections] = useState(false);
+  const [directionsError, setDirectionsError] = useState<string | null>(null);
 
   // Derived: selected route polyline
   const selectedRoute =
     routes.find((r) => r.type === selectedType) ?? routes[0] ?? null;
 
-  const selectedPolyline: LatLng[] = selectedRoute
-    ? selectedRoute.path.map((p) => ({ latitude: p.lat, longitude: p.lon }))
-    : [];
+  const googleForSelected = directionsByType[selectedType];
 
   // Step 1: fetch nearest location from server
   const fetchNearest = useCallback(async () => {
@@ -588,6 +650,8 @@ function RouteScreen() {
     setError(null);
     setLoadingNearest(true);
     setRoutes([]);
+    setDirectionsByType({});
+    setDirectionsError(null);
     setNearest(null);
     try {
       const res = await fetch(
@@ -612,6 +676,8 @@ function RouteScreen() {
     setError(null);
     setLoadingRoutes(true);
     setRoutes([]);
+    setDirectionsByType({});
+    setDirectionsError(null);
     try {
       const start = `${location.latitude},${location.longitude}`;
       const end = `${nearest.lat},${nearest.lon}`;
@@ -651,6 +717,52 @@ function RouteScreen() {
     if (nearest) fetchRoutes();
   }, [nearest]);
 
+  // Google turn-by-turn for the active route tab (cached per type until refresh)
+  useEffect(() => {
+    if (
+      !location ||
+      !nearest ||
+      routes.length === 0 ||
+      !GMAPS_KEY ||
+      googleApiBlocked
+    ) {
+      return;
+    }
+    if (directionsByType[selectedType]) return;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        setLoadingDirections(true);
+        setDirectionsError(null);
+        const dest: Coord = {
+          latitude: nearest.lat,
+          longitude: nearest.lon,
+        };
+        const dir = await fetchGoogleDirectionsForMode(
+          location,
+          dest,
+          selectedType,
+        );
+        if (cancelled) return;
+        setDirectionsByType((prev) => ({ ...prev, [selectedType]: dir }));
+      } catch (err) {
+        if (cancelled) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg !== "GOOGLE_API_LIMIT_REACHED") {
+          setDirectionsError(msg);
+        }
+      } finally {
+        if (!cancelled) setLoadingDirections(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [location, nearest, routes.length, selectedType, googleApiBlocked, GMAPS_KEY]);
+
   const isLoading = loadingNearest || loadingRoutes;
 
   return (
@@ -667,12 +779,16 @@ function RouteScreen() {
           longitudeDelta: 0.05,
         }}
       >
-        {/* All routes (dimmed) */}
+        {/* All routes (dimmed); active tab uses Google overview polyline when loaded */}
         {routes.map((r) => {
-          const coords = r.path.map((p) => ({
-            latitude: p.lat,
-            longitude: p.lon,
-          }));
+          const google = directionsByType[r.type];
+          const coords: LatLng[] =
+            google?.polyline && google.polyline.length > 0
+              ? google.polyline
+              : r.path.map((p) => ({
+                  latitude: p.lat,
+                  longitude: p.lon,
+                }));
           const isSelected = r.type === selectedType;
           return (
             <Polyline
@@ -742,6 +858,84 @@ function RouteScreen() {
               </TouchableOpacity>
             ))}
           </ScrollView>
+        )}
+
+        {/* Turn-by-turn (Google Directions) for the active route tab */}
+        {routes.length > 0 && location && nearest && (
+          <View style={styles.directionsSection}>
+            {!GMAPS_KEY && (
+              <Text style={styles.hintText}>
+                Set EXPO_PUBLIC_GOOGLE_MAPS_API_KEY (or app.json extra) for
+                turn-by-turn directions.
+              </Text>
+            )}
+            {googleApiBlocked && GMAPS_KEY ? (
+              <Text style={styles.hintText}>
+                Google API quota reached — reset in Config to load directions.
+              </Text>
+            ) : null}
+            {loadingDirections && GMAPS_KEY && !googleApiBlocked && (
+              <View style={styles.directionsLoadingRow}>
+                <ActivityIndicator color="#FF6B35" size="small" />
+                <Text style={styles.directionsLoadingText}>
+                  Loading directions…
+                </Text>
+              </View>
+            )}
+            {directionsError && !loadingDirections ? (
+              <Text style={styles.directionsErrorText}>{directionsError}</Text>
+            ) : null}
+            {googleForSelected && GMAPS_KEY && !googleApiBlocked ? (
+              <>
+                <View style={styles.directionsMetaRow}>
+                  <Text style={styles.directionsSummary} numberOfLines={2}>
+                    {googleForSelected.summary}
+                  </Text>
+                  <Text style={styles.directionsEta}>
+                    {googleForSelected.duration} · {googleForSelected.distance}
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.openMapsBtn}
+                  onPress={() =>
+                    openDirectionsInGoogleMaps(location, {
+                      latitude: nearest.lat,
+                      longitude: nearest.lon,
+                    })
+                  }
+                >
+                  <Ionicons name="open-outline" size={18} color="#fff" />
+                  <Text style={styles.openMapsBtnText}>Open in Google Maps</Text>
+                </TouchableOpacity>
+                <ScrollView
+                  style={styles.directionsScroll}
+                  nestedScrollEnabled
+                  keyboardShouldPersistTaps="handled"
+                >
+                  {googleForSelected.steps.map((step, i) => (
+                    <View key={`${step.startLat}-${i}`} style={styles.directionStep}>
+                      <Text
+                        style={[
+                          styles.directionStepIdx,
+                          { color: ROUTE_COLORS[selectedType] },
+                        ]}
+                      >
+                        {i + 1}
+                      </Text>
+                      <View style={styles.directionStepBody}>
+                        <Text style={styles.directionStepText}>
+                          {step.instruction}
+                        </Text>
+                        <Text style={styles.directionStepMeta}>
+                          {step.distance} · {step.duration}
+                        </Text>
+                      </View>
+                    </View>
+                  ))}
+                </ScrollView>
+              </>
+            ) : null}
+          </View>
         )}
 
         {/* Nearest info */}
@@ -990,6 +1184,84 @@ const styles = StyleSheet.create({
     color: "#888",
     fontSize: 12,
     textAlign: "center",
+  },
+  directionsSection: {
+    gap: 8,
+    marginTop: 4,
+  },
+  directionsLoadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    justifyContent: "center",
+  },
+  directionsLoadingText: {
+    color: "#aaa",
+    fontSize: 13,
+  },
+  directionsErrorText: {
+    color: "#e67e22",
+    fontSize: 12,
+    textAlign: "center",
+  },
+  directionsMetaRow: {
+    backgroundColor: "#1a1a2e",
+    borderRadius: 10,
+    padding: 10,
+    gap: 4,
+  },
+  directionsSummary: {
+    color: "#fff",
+    fontWeight: "600",
+    fontSize: 14,
+  },
+  directionsEta: {
+    color: "#aaa",
+    fontSize: 13,
+  },
+  openMapsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: "#2d6cdf",
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  openMapsBtnText: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 14,
+  },
+  directionsScroll: {
+    maxHeight: 220,
+  },
+  directionStep: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#2a2a3e",
+  },
+  directionStepIdx: {
+    fontWeight: "800",
+    fontSize: 13,
+    minWidth: 22,
+  },
+  directionStepBody: {
+    flex: 1,
+    gap: 4,
+  },
+  directionStepText: {
+    color: "#eee",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  directionStepMeta: {
+    color: "#888",
+    fontSize: 12,
   },
 });
 
