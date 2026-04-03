@@ -1047,12 +1047,39 @@ export default function App() {
       setChecking(true);
       try {
         const res = await fetch(`${url}/health`);
-        const data = await res.json();
+        const data: any = await res.json().catch(() => null);
+
+        const parseOk = (value: any): boolean => {
+          if (typeof value === "boolean") return value;
+          if (typeof value === "string") return value.toLowerCase() === "ok";
+          if (value && typeof value === "object") {
+            const status =
+              value.status ?? value.state ?? value.health ?? value.result;
+            return typeof status === "string"
+              ? status.toLowerCase() === "ok"
+              : typeof status === "boolean"
+                ? status
+                : false;
+          }
+          return false;
+        };
+
+        const hasField = (obj: any, key: string) =>
+          obj && Object.prototype.hasOwnProperty.call(obj, key);
+
+        const gatewayRaw = data?.gateway;
+        const gateway =
+          hasField(data, "gateway") && typeof gatewayRaw === "string"
+            ? gatewayRaw.toLowerCase() === "ok" ||
+              gatewayRaw.toLowerCase() === "up"
+            : hasField(data, "gateway")
+              ? parseOk(gatewayRaw)
+              : null;
 
         setHealthStatus({
-          gateway: true,
-          rag: data.rag === "ok",
-          graph: data.graph === "ok",
+          gateway,
+          rag: hasField(data, "rag") ? parseOk(data.rag) : null,
+          graph: hasField(data, "graph") ? parseOk(data.graph) : null,
         });
       } catch {
         setHealthStatus({ gateway: false, rag: null, graph: null });
