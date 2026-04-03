@@ -30,7 +30,6 @@ import {
 } from "react-native-safe-area-context";
 import * as Location from "expo-location";
 import Constants from "expo-constants";
-import Svg, { Polyline as SvgPolyline, Circle, G } from "react-native-svg";
 import MapView, {
   Polyline,
   Marker,
@@ -574,6 +573,7 @@ function RouteScreen() {
     );
   }, [selectedRoute]);
 
+  // Re-fit + re-project when selected tab changes
   useEffect(() => {
     if (!routes.length || !mapRef.current) return;
     const route = routes.find((r) => r.type === selectedType);
@@ -588,57 +588,6 @@ function RouteScreen() {
     });
   }, [selectedType, routes]);
 
-  const [screenSize, setScreenSize] = useState(() => Dimensions.get("window"));
-  const [mapRegion, setMapRegion] = useState<{
-    latitude: number;
-    longitude: number;
-    latitudeDelta: number;
-    longitudeDelta: number;
-  } | null>(null);
-
-  useEffect(() => {
-    const sub = Dimensions.addEventListener("change", ({ window }) =>
-      setScreenSize(window),
-    );
-    return () => sub.remove();
-  }, []);
-
-  // Projects a { lat, lon } to { x, y } in screen-pixel space.
-  // Uses the last known map region (updated via onRegionChange).
-  const projectToScreen = useCallback(
-    (lat: number, lon: number): { x: number; y: number } | null => {
-      if (!mapRegion) return null;
-      const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
-      const x = ((lon - longitude) / longitudeDelta + 0.5) * screenSize.width;
-      const y = (0.5 - (lat - latitude) / latitudeDelta) * screenSize.height;
-      return { x, y };
-    },
-    [mapRegion, screenSize],
-  );
-
-  // Pre-project all route paths whenever routes or map region changes.
-  const projectedRoutes = useMemo(() => {
-    if (!mapRegion) return [];
-    return routes.map((r) => {
-      const pts = r.path
-        .map((p) => projectToScreen(p.lat, p.lon))
-        .filter((p): p is { x: number; y: number } => p !== null);
-      return { type: r.type, pts };
-    });
-  }, [routes, mapRegion, projectToScreen]);
-
-  const projectedNearest = useMemo(() => {
-    if (!nearest || !mapRegion) return null;
-    return projectToScreen(nearest.lat, nearest.lon);
-  }, [nearest, mapRegion, projectToScreen]);
-  useEffect(() => {
-    const sub = Dimensions.addEventListener("change", ({ window }) =>
-      setScreenSize(window),
-    );
-    return () => sub.remove();
-  }, []);
-
-  // Step 1: fetch nearest location from server
   const fetchNearest = useCallback(async () => {
     if (!location || !baseURL) {
       setError("Location or gateway not available.");
@@ -665,7 +614,6 @@ function RouteScreen() {
     }
   }, [location, baseURL]);
 
-  // Step 2: fetch routes once we have nearest
   const fetchRoutes = useCallback(async () => {
     if (!location || !nearest || !baseURL) return;
     setError(null);
@@ -687,7 +635,6 @@ function RouteScreen() {
       setRoutes(data.routes ?? []);
       if (data.routes?.length) setSelectedType(data.routes[0].type);
 
-      // Fit map to show full route
       const allCoords: LatLng[] = data.routes.flatMap((r) =>
         r.path.map((p) => ({ latitude: p.lat, longitude: p.lon })),
       );
@@ -705,7 +652,6 @@ function RouteScreen() {
     }
   }, [location, nearest, baseURL]);
 
-  // Auto-fetch routes when nearest changes
   useEffect(() => {
     if (nearest) fetchRoutes();
   }, [nearest]);
@@ -714,14 +660,11 @@ function RouteScreen() {
 
   return (
     <View style={{ flex: 1 }}>
-      {/* ── MAP ── */}
       <MapView
         ref={mapRef}
         style={{ flex: 1 }}
         showsUserLocation
-        mapType={MAP_TYPES.NONE}
-        onRegionChange={(region) => setMapRegion(region)} // ← track region
-        onRegionChangeComplete={(region) => setMapRegion(region)}
+        mapType={MAP_TYPES.STANDARD}
         initialRegion={{
           latitude: location?.latitude ?? 18.5274,
           longitude: location?.longitude ?? 73.8732,
@@ -729,125 +672,62 @@ function RouteScreen() {
           longitudeDelta: 0.05,
         }}
       >
-        {/* OSM raster tiles — z-index war is now irrelevant */}
-        <UrlTile
-          urlTemplate={RASTER_TILE_URL}
-          maximumZ={19}
-          flipY={false}
-          shouldReplaceMapContent={Platform.OS === "ios"}
-          tileSize={256}
-        />
-
-        {/* ✅ NO Polyline or Marker children here anymore.
-            Everything is drawn in the SVG overlay below. */}
-      </MapView>
-
-      {/* ── SVG OVERLAY — always renders above the map ── */}
-      <Svg
-        style={[StyleSheet.absoluteFill, { zIndex: 10 }]}
-        pointerEvents="none" // touches fall through to MapView
-      >
         {/* Inactive routes */}
-        {projectedRoutes
+        {routes
           .filter((r) => r.type !== selectedType)
-          .map((r) => {
-            if (r.pts.length < 2) return null;
-            const pointsStr = r.pts.map((p) => `${p.x},${p.y}`).join(" ");
-            return (
-              <SvgPolyline
-                key={r.type}
-                points={pointsStr}
-                fill="none"
-                stroke="rgba(180,180,200,0.35)"
-                strokeWidth={3}
-                strokeDasharray="8,6"
-              />
-            );
-          })}
+          .map((r) => (
+            <Polyline
+              key={r.type}
+              coordinates={r.path.map((p) => ({
+                latitude: p.lat,
+                longitude: p.lon,
+              }))}
+              strokeColor="rgba(180,180,200,0.4)"
+              strokeWidth={3}
+              lineDashPattern={[8, 6]}
+            />
+          ))}
 
-        {/* Active route — white casing + colored line */}
         {(() => {
-          const active = projectedRoutes.find((r) => r.type === selectedType);
-          if (!active || active.pts.length < 2) return null;
-          const pointsStr = active.pts.map((p) => `${p.x},${p.y}`).join(" ");
-          const color = ROUTE_COLORS[selectedType];
+          const active = routes.find((r) => r.type === selectedType);
+          if (!active) return null;
+          const coords = active.path.map((p) => ({
+            latitude: p.lat,
+            longitude: p.lon,
+          }));
           return (
-            <G>
-              {/* White casing for depth */}
-              <SvgPolyline
-                points={pointsStr}
-                fill="none"
-                stroke="rgba(255,255,255,0.92)"
+            <>
+              <Polyline
+                coordinates={coords}
+                strokeColor="rgba(255,255,255,0.92)"
                 strokeWidth={12}
-                strokeLinecap="round"
-                strokeLinejoin="round"
+                zIndex={9}
+                geodesic
               />
-              {/* Colored route line */}
-              <SvgPolyline
-                points={pointsStr}
-                fill="none"
-                stroke={color}
+              <Polyline
+                coordinates={coords}
+                strokeColor="#0099ff"
                 strokeWidth={7}
-                strokeLinecap="round"
-                strokeLinejoin="round"
+                zIndex={10}
+                geodesic
               />
-            </G>
+            </>
           );
         })()}
 
-        {/* Destination pin (SVG circle — always visible) */}
-        {projectedNearest && (
-          <G>
-            {/* Outer pulse ring */}
-            <Circle
-              cx={projectedNearest.x}
-              cy={projectedNearest.y}
-              r={16}
-              fill="rgba(255,107,53,0.2)"
-            />
-            {/* White border */}
-            <Circle
-              cx={projectedNearest.x}
-              cy={projectedNearest.y}
-              r={10}
-              fill="white"
-            />
-            {/* Filled dot */}
-            <Circle
-              cx={projectedNearest.x}
-              cy={projectedNearest.y}
-              r={7}
-              fill="#FF6B35"
-            />
-          </G>
+        {nearest && typeof nearest.lat === "number" && (
+          <Marker
+            coordinate={{ latitude: nearest.lat, longitude: nearest.lon }}
+            title={nearest.name ?? "Nearest Location"}
+            pinColor="#FF6B35"
+          />
         )}
+      </MapView>
 
-        {/* User location dot (if you want to render it manually too) */}
-        {location &&
-          mapRegion &&
-          (() => {
-            const pt = projectToScreen(location.latitude, location.longitude);
-            if (!pt) return null;
-            return (
-              <G>
-                <Circle
-                  cx={pt.x}
-                  cy={pt.y}
-                  r={14}
-                  fill="rgba(66,133,244,0.2)"
-                />
-                <Circle cx={pt.x} cy={pt.y} r={9} fill="white" />
-                <Circle cx={pt.x} cy={pt.y} r={6} fill="#4285F4" />
-              </G>
-            );
-          })()}
-      </Svg>
-
-      {/* ── BOTTOM PANEL (unchanged) ── */}
+      {/* Bottom panel — completely unchanged */}
       <View style={styles.routePanel}>
         {error && <Text style={styles.errorText}>{error}</Text>}
 
-        {/* Route type tabs */}
         {routes.length > 0 && (
           <ScrollView
             horizontal
@@ -889,7 +769,6 @@ function RouteScreen() {
           </ScrollView>
         )}
 
-        {/* Turn-by-turn directions */}
         {routes.length > 0 && location && nearest && turnByTurn ? (
           <View style={styles.directionsSection}>
             <View style={styles.directionsSummaryBar}>
@@ -964,7 +843,6 @@ function RouteScreen() {
                         />
                       )}
                     </View>
-
                     <View style={styles.directionStepBody}>
                       <Text style={styles.directionStepText}>
                         {step.instruction}
@@ -986,7 +864,6 @@ function RouteScreen() {
           </View>
         ) : null}
 
-        {/* Nearest info card */}
         {nearest && (
           <View style={styles.nearestInfo}>
             <Text style={styles.nearestTitle}>
@@ -1002,7 +879,6 @@ function RouteScreen() {
           </View>
         )}
 
-        {/* Action button */}
         <TouchableOpacity
           style={[styles.primaryBtn, { marginTop: 8 }]}
           onPress={fetchNearest}
