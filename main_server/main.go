@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Location struct {
@@ -115,9 +119,51 @@ func nearestHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func pingUpstream(ctx context.Context, baseURL, path string) bool {
+	u, err := url.JoinPath(strings.TrimSuffix(baseURL, "/"), path)
+	if err != nil {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	return res.StatusCode < 500
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	ragURL := os.Getenv("RAG_SERVER_URL")
+	if ragURL == "" {
+		ragURL = "http://localhost:8000"
+	}
+	graphURL := os.Getenv("GRAPH_API_URL")
+	if graphURL == "" {
+		graphURL = "http://localhost:8080"
+	}
+
+	ragOK := pingUpstream(ctx, ragURL, "/health")
+	graphOK := pingUpstream(ctx, graphURL, "/health")
+
+	ragStatus, graphStatus := "down", "down"
+	if ragOK {
+		ragStatus = "ok"
+	}
+	if graphOK {
+		graphStatus = "ok"
+	}
 	status := map[string]string{
 		"gateway": "up",
+		"rag":     ragStatus,
+		"graph":   graphStatus,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
@@ -136,15 +182,34 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
+func singleHostProxy(target string) http.Handler {
+	u, err := url.Parse(target)
+	if err != nil {
+		log.Fatalf("invalid proxy target URL %q: %v", target, err)
+	}
+	return httputil.NewSingleHostReverseProxy(u)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "6000"
 	}
 
+	ragURL := os.Getenv("RAG_SERVER_URL")
+	if ragURL == "" {
+		ragURL = "http://localhost:8000"
+	}
+	graphURL := os.Getenv("GRAPH_API_URL")
+	if graphURL == "" {
+		graphURL = "http://localhost:8080"
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/nearest", nearestHandler)
 	mux.HandleFunc("/health", healthHandler)
+	mux.Handle("/rag/", http.StripPrefix("/rag", singleHostProxy(ragURL)))
+	mux.Handle("/graph/", http.StripPrefix("/graph", singleHostProxy(graphURL)))
 
 	handler := withCORS(mux)
 
