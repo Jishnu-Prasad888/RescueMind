@@ -3,6 +3,7 @@ import React, {
   useEffect,
   useRef,
   useCallback,
+  useMemo,
   createContext,
   useContext,
 } from "react";
@@ -28,16 +29,17 @@ import {
   useSafeAreaInsets,
 } from "react-native-safe-area-context";
 import * as Location from "expo-location";
+import Constants from "expo-constants";
+import Svg, { Polyline as SvgPolyline, Circle, G } from "react-native-svg";
 import MapView, {
   Polyline,
   Marker,
-  PROVIDER_GOOGLE,
+  UrlTile,
   LatLng,
+  MAP_TYPES,
 } from "react-native-maps";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
-import Constants from "expo-constants";
-import * as FileSystem from "expo-file-system/legacy";
 
 /* ───────────────── TYPES ───────────────── */
 
@@ -55,14 +57,12 @@ type Step = {
   startLng: number;
 };
 
-type GoogleRoute = {
-  index: number;
+type TurnByTurnRoute = {
   summary: string;
   distance: string;
   duration: string;
   distanceM: number;
   durationS: number;
-  polyline: LatLng[];
   steps: Step[];
 };
 
@@ -83,7 +83,7 @@ type NearestLocation = {
 /**
  * /nearest returns { nearest_location: string, distance_km: number }.
  * If the response has no numeric lat/lon we geocode the place name via
- * the Google Maps Geocoding API to obtain coordinates.
+ * OpenStreetMap Nominatim to obtain coordinates.
  */
 async function resolveNearestLocation(data: any): Promise<NearestLocation> {
   // Happy path — server already gave us coordinates
@@ -127,9 +127,7 @@ async function resolveNearestLocation(data: any): Promise<NearestLocation> {
     `?q=${encodeURIComponent(placeName)}` +
     `&format=json&limit=1`;
 
-  const res = await fetch(nominatimUrl, {
-    headers: { "User-Agent": "RescueMindApp/1.0" },
-  });
+  const res = await fetch(nominatimUrl, { headers: nominatimHeaders() });
   const json = await res.json();
 
   if (!Array.isArray(json) || json.length === 0) {
@@ -164,9 +162,6 @@ type AppContextType = {
   checking: boolean;
   checkHealth: (ip?: string) => void;
   location: Coord | null;
-  googleApiRequestCount: number;
-  googleApiBlocked: boolean;
-  resetGoogleApiQuota: () => Promise<void>;
 };
 
 /* ───────────────── CONTEXT ───────────────── */
@@ -174,51 +169,208 @@ type AppContextType = {
 const AppContext = createContext<AppContextType>({} as AppContextType);
 const useApp = () => useContext(AppContext);
 
-/* ───────────────── CONFIG ───────────────── */
-
-const GMAPS_KEY =
-  Constants.expoConfig?.extra?.googleMapsApiKey ??
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ??
-  "";
-const GOOGLE_API_REQUEST_LIMIT = 500;
-const GOOGLE_API_QUOTA_FILE =
-  (FileSystem.documentDirectory ?? "") + "google-api-quota.json";
-
 /* ───────────────── UTILS ───────────────── */
 
-function decodePolyline(encoded: string): LatLng[] {
-  let index = 0,
-    lat = 0,
-    lng = 0;
-  const result: LatLng[] = [];
+/** ~50 km/h — rough segment times for path-based directions only */
+const ASSUMED_SPEED_MPS = 50 / 3.6;
 
-  while (index < encoded.length) {
-    let b,
-      shift = 0,
-      result_ = 0;
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result_ |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+/**
+ * Do not use tile.openstreetmap.org in mobile apps: native tile requests cannot
+ * set a compliant User-Agent, so OSMF often blocks them. CARTO basemaps are
+ * OSM-based and suited for app use (still attribute OSM + CARTO).
+ */
+const RASTER_TILE_URL =
+  "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png";
 
-    lat += result_ & 1 ? ~(result_ >> 1) : result_ >> 1;
+/** https://operations.osmfoundation.org/policies/nominatim/ */
+function nominatimHeaders(): Record<string, string> {
+  const id =
+    Constants.expoConfig?.android?.package ??
+    Constants.expoConfig?.ios?.bundleIdentifier ??
+    "com.rescuemind.app";
+  const contactUrl = process.env.EXPO_PUBLIC_NOMINATIM_CONTACT?.trim();
+  const ua = contactUrl
+    ? `RescueMind/1.0 (${id}; ${contactUrl})`
+    : `RescueMind/1.0 (${id})`;
+  const h: Record<string, string> = { "User-Agent": ua };
+  const from = process.env.EXPO_PUBLIC_NOMINATIM_FROM_EMAIL?.trim();
+  if (from) h.From = from;
+  return h;
+}
 
-    shift = 0;
-    result_ = 0;
+function formatDistanceM(m: number): string {
+  if (!Number.isFinite(m) || m < 0) return "—";
+  if (m < 1000) return `${Math.round(m)} m`;
+  return `${(m / 1000).toFixed(2)} km`;
+}
 
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result_ |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+function formatDurationS(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `${h} h ${mm} min`;
+  }
+  if (m === 0) return `${s} s`;
+  return `${m} min ${s} s`;
+}
 
-    lng += result_ & 1 ? ~(result_ >> 1) : result_ >> 1;
+function haversineM(a: Coord, b: Coord): number {
+  const R = 6371000;
+  const φ1 = (a.latitude * Math.PI) / 180;
+  const φ2 = (b.latitude * Math.PI) / 180;
+  const Δφ = ((b.latitude - a.latitude) * Math.PI) / 180;
+  const Δλ = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const s =
+    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
 
-    result.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
+function bearingDeg(a: Coord, b: Coord): number {
+  const φ1 = (a.latitude * Math.PI) / 180;
+  const φ2 = (b.latitude * Math.PI) / 180;
+  const Δλ = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x =
+    Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  let θ = (Math.atan2(y, x) * 180) / Math.PI;
+  return (θ + 360) % 360;
+}
+
+function angleDiffDeg(from: number, to: number): number {
+  return ((to - from + 540) % 360) - 180;
+}
+
+function cardinal8(deg: number): string {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return dirs[Math.round(deg / 45) % 8];
+}
+
+function turnPhrase(delta: number): string | null {
+  const abs = Math.abs(delta);
+  if (abs < 22) return null;
+  const dir = delta > 0 ? "right" : "left";
+  if (abs < 45) return `Bear slightly ${dir}`;
+  if (abs < 130) return `Turn ${dir}`;
+  if (abs < 170) return `Turn sharp ${dir}`;
+  return `Make a U-turn to the ${dir}`;
+}
+
+/**
+ * Turn-by-turn cues derived from the backend route polyline so the line on the map
+ * and the steps stay aligned for each tab (FASTEST / SAFEST / SHORTEST).
+ */
+function buildDirectionsFromPath(
+  path: { lat: number; lon: number }[],
+  distanceM: number,
+  durationS: number,
+  modeLabel: string,
+): TurnByTurnRoute {
+  const pts: Coord[] = path.map((p) => ({
+    latitude: p.lat,
+    longitude: p.lon,
+  }));
+
+  if (pts.length < 2) {
+    return {
+      summary: `${modeLabel} · route`,
+      distance: formatDistanceM(distanceM),
+      duration: formatDurationS(durationS),
+      distanceM,
+      durationS,
+      steps: [
+        {
+          instruction: "You are already at the destination.",
+          distance: "—",
+          duration: "—",
+          startLat: pts[0]?.latitude ?? 0,
+          startLng: pts[0]?.longitude ?? 0,
+        },
+      ],
+    };
   }
 
-  return result;
+  const steps: Step[] = [];
+  let runM = 0;
+  let runStart: Coord = pts[0];
+
+  const pushContinue = (meters: number, at: Coord) => {
+    if (meters < 20) return;
+    const sec = meters / ASSUMED_SPEED_MPS;
+    steps.push({
+      instruction: `Continue along the route for ${formatDistanceM(meters)}`,
+      distance: formatDistanceM(meters),
+      duration: formatDurationS(sec),
+      startLat: at.latitude,
+      startLng: at.longitude,
+    });
+  };
+
+  steps.push({
+    instruction: `Head ${cardinal8(bearingDeg(pts[0], pts[1]))} along the highlighted route`,
+    distance: "—",
+    duration: "—",
+    startLat: pts[0].latitude,
+    startLng: pts[0].longitude,
+  });
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const brgIn = bearingDeg(pts[i - 1], pts[i]);
+    const brgOut = bearingDeg(pts[i], pts[i + 1]);
+    const segM = haversineM(pts[i - 1], pts[i]);
+    runM += segM;
+    const phrase = turnPhrase(angleDiffDeg(brgIn, brgOut));
+    if (phrase) {
+      pushContinue(runM, runStart);
+      runM = 0;
+      runStart = pts[i];
+      steps.push({
+        instruction: phrase,
+        distance: "—",
+        duration: "—",
+        maneuver: phrase,
+        startLat: pts[i].latitude,
+        startLng: pts[i].longitude,
+      });
+    }
+  }
+
+  runM += haversineM(pts[pts.length - 2], pts[pts.length - 1]);
+  pushContinue(runM, runStart);
+
+  const last = pts[pts.length - 1];
+  const finLeg = haversineM(pts[pts.length - 2], last);
+  steps.push({
+    instruction: "Arrive at your destination",
+    distance: formatDistanceM(finLeg),
+    duration: formatDurationS(finLeg / ASSUMED_SPEED_MPS),
+    startLat: last.latitude,
+    startLng: last.longitude,
+  });
+
+  return {
+    summary: `${modeLabel} · RescueMind graph route`,
+    distance: formatDistanceM(distanceM),
+    duration: formatDurationS(durationS),
+    distanceM,
+    durationS,
+    steps,
+  };
+}
+
+function openDirectionsInOpenStreetMap(
+  origin: Coord,
+  destination: Coord,
+): void {
+  const o = `${origin.latitude},${origin.longitude}`;
+  const d = `${destination.latitude},${destination.longitude}`;
+  const url = `https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${encodeURIComponent(o)}%3B${encodeURIComponent(d)}`;
+  Linking.openURL(url).catch(() => {
+    Alert.alert("Could not open maps", "No app available to handle the link.");
+  });
 }
 
 function normalizeGatewayUrl(value: string): string {
@@ -228,195 +380,12 @@ function normalizeGatewayUrl(value: string): string {
   return `http://${trimmed}`;
 }
 
-type GoogleApiQuotaState = {
-  requestCount: number;
-  blocked: boolean;
-};
-
-async function writeGoogleApiQuotaState(
-  state: GoogleApiQuotaState,
-): Promise<void> {
-  await FileSystem.writeAsStringAsync(
-    GOOGLE_API_QUOTA_FILE,
-    JSON.stringify(state),
-  );
-}
-
-async function getGoogleApiQuotaState(): Promise<{
-  requestCount: number;
-  blocked: boolean;
-}> {
-  try {
-    if (!FileSystem.documentDirectory) {
-      return { requestCount: 0, blocked: false };
-    }
-
-    const fileInfo = await FileSystem.getInfoAsync(GOOGLE_API_QUOTA_FILE);
-    if (!fileInfo.exists) {
-      return { requestCount: 0, blocked: false };
-    }
-
-    const raw = await FileSystem.readAsStringAsync(GOOGLE_API_QUOTA_FILE);
-    const parsed = JSON.parse(raw) as Partial<GoogleApiQuotaState>;
-    const requestCount =
-      typeof parsed.requestCount === "number" &&
-      Number.isFinite(parsed.requestCount)
-        ? parsed.requestCount
-        : 0;
-    const blocked = parsed.blocked === true;
-
-    return { requestCount, blocked };
-  } catch {
-    return { requestCount: 0, blocked: false };
-  }
-}
-
-async function setGoogleApiBlocked(blocked: boolean): Promise<void> {
-  const state = await getGoogleApiQuotaState();
-  await writeGoogleApiQuotaState({ ...state, blocked });
-}
-
-async function assertGoogleApiCallAllowed() {
-  const state = await getGoogleApiQuotaState();
-
-  if (state.blocked || state.requestCount >= GOOGLE_API_REQUEST_LIMIT) {
-    await setGoogleApiBlocked(true);
-    Alert.alert(
-      "Google API limit reached",
-      "Maximum 500 requests reached. Google API calls are blocked until you manually reset the counter.",
-    );
-    throw new Error("GOOGLE_API_LIMIT_REACHED");
-  }
-}
-
-async function incrementGoogleApiRequestCounter(): Promise<number> {
-  const state = await getGoogleApiQuotaState();
-  const nextCount = state.requestCount + 1;
-  const shouldBlock = nextCount >= GOOGLE_API_REQUEST_LIMIT;
-
-  await writeGoogleApiQuotaState({
-    requestCount: nextCount,
-    blocked: shouldBlock,
-  });
-
-  if (shouldBlock) {
-    Alert.alert(
-      "Google API limit reached",
-      "Maximum 500 requests reached. Google API calls are now blocked until you manually reset the counter.",
-    );
-  }
-
-  return nextCount;
-}
-
-/* ───────────────── GOOGLE DIRECTIONS ───────────────── */
-
-function mapGoogleRoutePayload(r: any, i: number): GoogleRoute {
-  const leg = r.legs[0];
-  const durationTrafficS =
-    typeof leg.duration_in_traffic?.value === "number"
-      ? leg.duration_in_traffic.value
-      : leg.duration.value;
-
-  return {
-    index: i,
-    summary: r.summary,
-    distance: leg.distance.text,
-    duration: leg.duration_in_traffic?.text ?? leg.duration.text,
-    distanceM: leg.distance.value,
-    durationS: durationTrafficS,
-    polyline: decodePolyline(r.overview_polyline.points),
-    steps: leg.steps.map(
-      (s: any): Step => ({
-        instruction: s.html_instructions.replace(/<[^>]*>/g, ""),
-        distance: s.distance.text,
-        duration: s.duration.text,
-        maneuver: s.maneuver,
-        startLat: s.start_location.lat,
-        startLng: s.start_location.lng,
-      }),
-    ),
-  };
-}
-
-/**
- * Turn-by-turn directions aligned with the active route tab:
- * FASTEST — traffic-aware alternatives, pick shortest ETA
- * SAFEST — avoid highways (calmer roads)
- * SHORTEST — alternatives, pick minimum distance
- */
-async function fetchGoogleDirectionsForMode(
-  origin: Coord,
-  destination: Coord,
-  mode: ServerRoute["type"],
-): Promise<GoogleRoute> {
-  await assertGoogleApiCallAllowed();
-
-  const dest = `${destination.latitude},${destination.longitude}`;
-  const org = `${origin.latitude},${origin.longitude}`;
-
-  let url =
-    `https://maps.googleapis.com/maps/api/directions/json` +
-    `?origin=${org}` +
-    `&destination=${dest}` +
-    `&key=${GMAPS_KEY}`;
-
-  if (mode === "FASTEST") {
-    url +=
-      `&alternatives=true` +
-      `&departure_time=now` +
-      `&traffic_model=best_guess`;
-  } else if (mode === "SAFEST") {
-    url += `&avoid=highways`;
-  } else {
-    url += `&alternatives=true`;
-  }
-
-  const res = await fetch(url);
-  const data = await res.json();
-  await incrementGoogleApiRequestCounter();
-
-  if (data.status !== "OK") {
-    throw new Error(
-      `Directions: ${data.status}${data.error_message ? ` — ${data.error_message}` : ""}`,
-    );
-  }
-
-  const mapped: GoogleRoute[] = data.routes.map((r: any, i: number) =>
-    mapGoogleRoutePayload(r, i),
-  );
-
-  if (mapped.length === 0) {
-    throw new Error("Directions: no routes returned");
-  }
-
-  if (mapped.length === 1) return mapped[0];
-
-  if (mode === "FASTEST") {
-    return mapped.reduce((a, b) => (a.durationS <= b.durationS ? a : b));
-  }
-  if (mode === "SHORTEST") {
-    return mapped.reduce((a, b) => (a.distanceM <= b.distanceM ? a : b));
-  }
-  return mapped[0];
-}
-
-function openDirectionsInGoogleMaps(origin: Coord, destination: Coord): void {
-  const o = `${origin.latitude},${origin.longitude}`;
-  const d = `${destination.latitude},${destination.longitude}`;
-  const q = `api=1&origin=${encodeURIComponent(o)}&destination=${encodeURIComponent(d)}&travelmode=driving`;
-  const url = `https://www.google.com/maps/dir/?${q}`;
-  Linking.openURL(url).catch(() => {
-    Alert.alert("Could not open maps", "No app available to handle the link.");
-  });
-}
-
 /* ───────────────── ROUTE COLORS ───────────────── */
 
 const ROUTE_COLORS: Record<ServerRoute["type"], string> = {
-  FASTEST: "#FF6B35", // orange
-  SAFEST: "#2EC4B6", // teal
-  SHORTEST: "#9B59B6", // purple
+  FASTEST: "#4285F4", // Google Maps blue
+  SAFEST: "#34A853", // Google Maps green
+  SHORTEST: "#9B59B6",
 };
 
 const ROUTE_LABELS: Record<ServerRoute["type"], string> = {
@@ -428,16 +397,8 @@ const ROUTE_LABELS: Record<ServerRoute["type"], string> = {
 /* ───────────────── SCREENS ───────────────── */
 
 function ConfigScreen() {
-  const {
-    gatewayIP,
-    setGatewayIP,
-    checkHealth,
-    healthStatus,
-    checking,
-    googleApiRequestCount,
-    googleApiBlocked,
-    resetGoogleApiQuota,
-  } = useApp();
+  const { gatewayIP, setGatewayIP, checkHealth, healthStatus, checking } =
+    useApp();
   const [draft, setDraft] = useState(gatewayIP);
 
   const dot = (val: boolean | null) =>
@@ -488,36 +449,6 @@ function ConfigScreen() {
             </Text>
           </View>
         )}
-
-        <View style={styles.divider} />
-
-        <Text style={styles.heading}>Google Maps API</Text>
-        <View style={styles.quotaCard}>
-          <Text style={styles.quotaText}>
-            Requests used:{" "}
-            <Text style={styles.quotaBold}>
-              {googleApiRequestCount} / {GOOGLE_API_REQUEST_LIMIT}
-            </Text>
-          </Text>
-          <Text style={styles.quotaText}>
-            Status:{" "}
-            <Text
-              style={[
-                styles.quotaBold,
-                { color: googleApiBlocked ? "#e74c3c" : "#2ecc71" },
-              ]}
-            >
-              {googleApiBlocked ? "Blocked" : "Active"}
-            </Text>
-          </Text>
-        </View>
-
-        <TouchableOpacity
-          style={[styles.primaryBtn, { backgroundColor: "#555" }]}
-          onPress={resetGoogleApiQuota}
-        >
-          <Text style={styles.primaryBtnText}>Reset API Counter</Text>
-        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -619,7 +550,7 @@ function RAGScreen() {
 /* ───────────────── ROUTE SCREEN ───────────────── */
 
 function RouteScreen() {
-  const { location, baseURL, googleApiBlocked } = useApp();
+  const { location, baseURL } = useApp();
   const mapRef = useRef<MapView>(null);
 
   const [nearest, setNearest] = useState<NearestLocation | null>(null);
@@ -629,17 +560,83 @@ function RouteScreen() {
   const [loadingNearest, setLoadingNearest] = useState(false);
   const [loadingRoutes, setLoadingRoutes] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [directionsByType, setDirectionsByType] = useState<
-    Partial<Record<ServerRoute["type"], GoogleRoute>>
-  >({});
-  const [loadingDirections, setLoadingDirections] = useState(false);
-  const [directionsError, setDirectionsError] = useState<string | null>(null);
 
-  // Derived: selected route polyline
   const selectedRoute =
     routes.find((r) => r.type === selectedType) ?? routes[0] ?? null;
 
-  const googleForSelected = directionsByType[selectedType];
+  const turnByTurn = useMemo((): TurnByTurnRoute | null => {
+    if (!selectedRoute || selectedRoute.path.length < 2) return null;
+    return buildDirectionsFromPath(
+      selectedRoute.path,
+      selectedRoute.distance,
+      selectedRoute.time,
+      ROUTE_LABELS[selectedRoute.type],
+    );
+  }, [selectedRoute]);
+
+  useEffect(() => {
+    if (!routes.length || !mapRef.current) return;
+    const route = routes.find((r) => r.type === selectedType);
+    if (!route || route.path.length < 2) return;
+    const coords: LatLng[] = route.path.map((p) => ({
+      latitude: p.lat,
+      longitude: p.lon,
+    }));
+    mapRef.current.fitToCoordinates(coords, {
+      edgePadding: { top: 80, right: 40, bottom: 320, left: 40 },
+      animated: true,
+    });
+  }, [selectedType, routes]);
+
+  const [screenSize, setScreenSize] = useState(() => Dimensions.get("window"));
+  const [mapRegion, setMapRegion] = useState<{
+    latitude: number;
+    longitude: number;
+    latitudeDelta: number;
+    longitudeDelta: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const sub = Dimensions.addEventListener("change", ({ window }) =>
+      setScreenSize(window),
+    );
+    return () => sub.remove();
+  }, []);
+
+  // Projects a { lat, lon } to { x, y } in screen-pixel space.
+  // Uses the last known map region (updated via onRegionChange).
+  const projectToScreen = useCallback(
+    (lat: number, lon: number): { x: number; y: number } | null => {
+      if (!mapRegion) return null;
+      const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
+      const x = ((lon - longitude) / longitudeDelta + 0.5) * screenSize.width;
+      const y = (0.5 - (lat - latitude) / latitudeDelta) * screenSize.height;
+      return { x, y };
+    },
+    [mapRegion, screenSize],
+  );
+
+  // Pre-project all route paths whenever routes or map region changes.
+  const projectedRoutes = useMemo(() => {
+    if (!mapRegion) return [];
+    return routes.map((r) => {
+      const pts = r.path
+        .map((p) => projectToScreen(p.lat, p.lon))
+        .filter((p): p is { x: number; y: number } => p !== null);
+      return { type: r.type, pts };
+    });
+  }, [routes, mapRegion, projectToScreen]);
+
+  const projectedNearest = useMemo(() => {
+    if (!nearest || !mapRegion) return null;
+    return projectToScreen(nearest.lat, nearest.lon);
+  }, [nearest, mapRegion, projectToScreen]);
+  useEffect(() => {
+    const sub = Dimensions.addEventListener("change", ({ window }) =>
+      setScreenSize(window),
+    );
+    return () => sub.remove();
+  }, []);
 
   // Step 1: fetch nearest location from server
   const fetchNearest = useCallback(async () => {
@@ -650,8 +647,6 @@ function RouteScreen() {
     setError(null);
     setLoadingNearest(true);
     setRoutes([]);
-    setDirectionsByType({});
-    setDirectionsError(null);
     setNearest(null);
     try {
       const res = await fetch(
@@ -676,8 +671,6 @@ function RouteScreen() {
     setError(null);
     setLoadingRoutes(true);
     setRoutes([]);
-    setDirectionsByType({});
-    setDirectionsError(null);
     try {
       const start = `${location.latitude},${location.longitude}`;
       const end = `${nearest.lat},${nearest.lon}`;
@@ -717,61 +710,18 @@ function RouteScreen() {
     if (nearest) fetchRoutes();
   }, [nearest]);
 
-  // Google turn-by-turn for the active route tab (cached per type until refresh)
-  useEffect(() => {
-    if (
-      !location ||
-      !nearest ||
-      routes.length === 0 ||
-      !GMAPS_KEY ||
-      googleApiBlocked
-    ) {
-      return;
-    }
-    if (directionsByType[selectedType]) return;
-
-    let cancelled = false;
-
-    (async () => {
-      try {
-        setLoadingDirections(true);
-        setDirectionsError(null);
-        const dest: Coord = {
-          latitude: nearest.lat,
-          longitude: nearest.lon,
-        };
-        const dir = await fetchGoogleDirectionsForMode(
-          location,
-          dest,
-          selectedType,
-        );
-        if (cancelled) return;
-        setDirectionsByType((prev) => ({ ...prev, [selectedType]: dir }));
-      } catch (err) {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg !== "GOOGLE_API_LIMIT_REACHED") {
-          setDirectionsError(msg);
-        }
-      } finally {
-        if (!cancelled) setLoadingDirections(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [location, nearest, routes.length, selectedType, googleApiBlocked, GMAPS_KEY]);
-
   const isLoading = loadingNearest || loadingRoutes;
 
   return (
     <View style={{ flex: 1 }}>
+      {/* ── MAP ── */}
       <MapView
         ref={mapRef}
-        provider={PROVIDER_GOOGLE}
         style={{ flex: 1 }}
         showsUserLocation
+        mapType={MAP_TYPES.NONE}
+        onRegionChange={(region) => setMapRegion(region)} // ← track region
+        onRegionChangeComplete={(region) => setMapRegion(region)}
         initialRegion={{
           latitude: location?.latitude ?? 18.5274,
           longitude: location?.longitude ?? 73.8732,
@@ -779,46 +729,125 @@ function RouteScreen() {
           longitudeDelta: 0.05,
         }}
       >
-        {/* All routes (dimmed); active tab uses Google overview polyline when loaded */}
-        {routes.map((r) => {
-          const google = directionsByType[r.type];
-          const coords: LatLng[] =
-            google?.polyline && google.polyline.length > 0
-              ? google.polyline
-              : r.path.map((p) => ({
-                  latitude: p.lat,
-                  longitude: p.lon,
-                }));
-          const isSelected = r.type === selectedType;
-          return (
-            <Polyline
-              key={r.type}
-              coordinates={coords}
-              strokeColor={isSelected ? ROUTE_COLORS[r.type] : "#ccc"}
-              strokeWidth={isSelected ? 5 : 2}
-              zIndex={isSelected ? 10 : 1}
-            />
-          );
-        })}
+        {/* OSM raster tiles — z-index war is now irrelevant */}
+        <UrlTile
+          urlTemplate={RASTER_TILE_URL}
+          maximumZ={19}
+          flipY={false}
+          shouldReplaceMapContent={Platform.OS === "ios"}
+          tileSize={256}
+        />
 
-        {/* Nearest location marker */}
-        {nearest &&
-          typeof nearest.lat === "number" &&
-          typeof nearest.lon === "number" && (
-            <Marker
-              coordinate={{ latitude: nearest.lat, longitude: nearest.lon }}
-              title={nearest.name ?? "Nearest Location"}
-              description={`${nearest.lat.toFixed(5)}, ${nearest.lon.toFixed(5)}`}
-              pinColor="#FF6B35"
-            />
-          )}
+        {/* ✅ NO Polyline or Marker children here anymore.
+            Everything is drawn in the SVG overlay below. */}
       </MapView>
 
-      {/* Overlay panel */}
+      {/* ── SVG OVERLAY — always renders above the map ── */}
+      <Svg
+        style={[StyleSheet.absoluteFill, { zIndex: 10 }]}
+        pointerEvents="none" // touches fall through to MapView
+      >
+        {/* Inactive routes */}
+        {projectedRoutes
+          .filter((r) => r.type !== selectedType)
+          .map((r) => {
+            if (r.pts.length < 2) return null;
+            const pointsStr = r.pts.map((p) => `${p.x},${p.y}`).join(" ");
+            return (
+              <SvgPolyline
+                key={r.type}
+                points={pointsStr}
+                fill="none"
+                stroke="rgba(180,180,200,0.35)"
+                strokeWidth={3}
+                strokeDasharray="8,6"
+              />
+            );
+          })}
+
+        {/* Active route — white casing + colored line */}
+        {(() => {
+          const active = projectedRoutes.find((r) => r.type === selectedType);
+          if (!active || active.pts.length < 2) return null;
+          const pointsStr = active.pts.map((p) => `${p.x},${p.y}`).join(" ");
+          const color = ROUTE_COLORS[selectedType];
+          return (
+            <G>
+              {/* White casing for depth */}
+              <SvgPolyline
+                points={pointsStr}
+                fill="none"
+                stroke="rgba(255,255,255,0.92)"
+                strokeWidth={12}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              {/* Colored route line */}
+              <SvgPolyline
+                points={pointsStr}
+                fill="none"
+                stroke={color}
+                strokeWidth={7}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </G>
+          );
+        })()}
+
+        {/* Destination pin (SVG circle — always visible) */}
+        {projectedNearest && (
+          <G>
+            {/* Outer pulse ring */}
+            <Circle
+              cx={projectedNearest.x}
+              cy={projectedNearest.y}
+              r={16}
+              fill="rgba(255,107,53,0.2)"
+            />
+            {/* White border */}
+            <Circle
+              cx={projectedNearest.x}
+              cy={projectedNearest.y}
+              r={10}
+              fill="white"
+            />
+            {/* Filled dot */}
+            <Circle
+              cx={projectedNearest.x}
+              cy={projectedNearest.y}
+              r={7}
+              fill="#FF6B35"
+            />
+          </G>
+        )}
+
+        {/* User location dot (if you want to render it manually too) */}
+        {location &&
+          mapRegion &&
+          (() => {
+            const pt = projectToScreen(location.latitude, location.longitude);
+            if (!pt) return null;
+            return (
+              <G>
+                <Circle
+                  cx={pt.x}
+                  cy={pt.y}
+                  r={14}
+                  fill="rgba(66,133,244,0.2)"
+                />
+                <Circle cx={pt.x} cy={pt.y} r={9} fill="white" />
+                <Circle cx={pt.x} cy={pt.y} r={6} fill="#4285F4" />
+              </G>
+            );
+          })()}
+      </Svg>
+
+      {/* ── BOTTOM PANEL (unchanged) ── */}
       <View style={styles.routePanel}>
         {error && <Text style={styles.errorText}>{error}</Text>}
 
-        {/* Route type selector */}
+        {/* Route type tabs */}
         {routes.length > 0 && (
           <ScrollView
             horizontal
@@ -860,85 +889,104 @@ function RouteScreen() {
           </ScrollView>
         )}
 
-        {/* Turn-by-turn (Google Directions) for the active route tab */}
-        {routes.length > 0 && location && nearest && (
+        {/* Turn-by-turn directions */}
+        {routes.length > 0 && location && nearest && turnByTurn ? (
           <View style={styles.directionsSection}>
-            {!GMAPS_KEY && (
-              <Text style={styles.hintText}>
-                Set EXPO_PUBLIC_GOOGLE_MAPS_API_KEY (or app.json extra) for
-                turn-by-turn directions.
-              </Text>
-            )}
-            {googleApiBlocked && GMAPS_KEY ? (
-              <Text style={styles.hintText}>
-                Google API quota reached — reset in Config to load directions.
-              </Text>
-            ) : null}
-            {loadingDirections && GMAPS_KEY && !googleApiBlocked && (
-              <View style={styles.directionsLoadingRow}>
-                <ActivityIndicator color="#FF6B35" size="small" />
-                <Text style={styles.directionsLoadingText}>
-                  Loading directions…
+            <View style={styles.directionsSummaryBar}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.directionsSummary} numberOfLines={1}>
+                  {ROUTE_LABELS[selectedType]}
+                </Text>
+                <Text style={styles.directionsEta}>
+                  {turnByTurn.duration} · {turnByTurn.distance}
                 </Text>
               </View>
-            )}
-            {directionsError && !loadingDirections ? (
-              <Text style={styles.directionsErrorText}>{directionsError}</Text>
-            ) : null}
-            {googleForSelected && GMAPS_KEY && !googleApiBlocked ? (
-              <>
-                <View style={styles.directionsMetaRow}>
-                  <Text style={styles.directionsSummary} numberOfLines={2}>
-                    {googleForSelected.summary}
-                  </Text>
-                  <Text style={styles.directionsEta}>
-                    {googleForSelected.duration} · {googleForSelected.distance}
-                  </Text>
-                </View>
-                <TouchableOpacity
-                  style={styles.openMapsBtn}
-                  onPress={() =>
-                    openDirectionsInGoogleMaps(location, {
-                      latitude: nearest.lat,
-                      longitude: nearest.lon,
-                    })
-                  }
-                >
-                  <Ionicons name="open-outline" size={18} color="#fff" />
-                  <Text style={styles.openMapsBtnText}>Open in Google Maps</Text>
-                </TouchableOpacity>
-                <ScrollView
-                  style={styles.directionsScroll}
-                  nestedScrollEnabled
-                  keyboardShouldPersistTaps="handled"
-                >
-                  {googleForSelected.steps.map((step, i) => (
-                    <View key={`${step.startLat}-${i}`} style={styles.directionStep}>
-                      <Text
+              <TouchableOpacity
+                style={styles.openMapsBtn}
+                onPress={() =>
+                  openDirectionsInOpenStreetMap(location, {
+                    latitude: nearest.lat,
+                    longitude: nearest.lon,
+                  })
+                }
+              >
+                <Ionicons name="open-outline" size={16} color="#fff" />
+                <Text style={styles.openMapsBtnText}>OSM</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              style={styles.directionsScroll}
+              nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {turnByTurn.steps.map((step, i) => {
+                const isLast = i === turnByTurn.steps.length - 1;
+                const icon = isLast
+                  ? "flag"
+                  : step.maneuver?.toLowerCase().includes("left")
+                    ? "arrow-back"
+                    : step.maneuver?.toLowerCase().includes("right")
+                      ? "arrow-forward"
+                      : step.maneuver?.toLowerCase().includes("u-turn")
+                        ? "return-up-back"
+                        : i === 0
+                          ? "navigate"
+                          : "arrow-up";
+                return (
+                  <View
+                    key={`${step.startLat}-${step.startLng}-${i}`}
+                    style={styles.directionStep}
+                  >
+                    <View style={styles.directionStepLeft}>
+                      <View
                         style={[
-                          styles.directionStepIdx,
-                          { color: ROUTE_COLORS[selectedType] },
+                          styles.directionStepDot,
+                          {
+                            backgroundColor: isLast
+                              ? "#e74c3c"
+                              : ROUTE_COLORS[selectedType],
+                          },
                         ]}
                       >
-                        {i + 1}
-                      </Text>
-                      <View style={styles.directionStepBody}>
-                        <Text style={styles.directionStepText}>
-                          {step.instruction}
-                        </Text>
-                        <Text style={styles.directionStepMeta}>
-                          {step.distance} · {step.duration}
-                        </Text>
+                        <Ionicons name={icon as any} size={12} color="#fff" />
                       </View>
+                      {!isLast && (
+                        <View
+                          style={[
+                            styles.directionStepLine,
+                            {
+                              backgroundColor:
+                                ROUTE_COLORS[selectedType] + "55",
+                            },
+                          ]}
+                        />
+                      )}
                     </View>
-                  ))}
-                </ScrollView>
-              </>
-            ) : null}
-          </View>
-        )}
 
-        {/* Nearest info */}
+                    <View style={styles.directionStepBody}>
+                      <Text style={styles.directionStepText}>
+                        {step.instruction}
+                      </Text>
+                      {(step.distance !== "—" || step.duration !== "—") && (
+                        <Text style={styles.directionStepMeta}>
+                          {step.distance !== "—" ? step.distance : ""}
+                          {step.distance !== "—" && step.duration !== "—"
+                            ? "  ·  "
+                            : ""}
+                          {step.duration !== "—" ? step.duration : ""}
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+          </View>
+        ) : null}
+
+        {/* Nearest info card */}
         {nearest && (
           <View style={styles.nearestInfo}>
             <Text style={styles.nearestTitle}>
@@ -1044,26 +1092,6 @@ const styles = StyleSheet.create({
   healthRow: {
     color: "#ccc",
     fontSize: 14,
-  },
-  divider: {
-    height: 1,
-    backgroundColor: "#222",
-    marginVertical: 20,
-  },
-  quotaCard: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 12,
-    gap: 6,
-  },
-  quotaText: {
-    color: "#ccc",
-    fontSize: 14,
-  },
-  quotaBold: {
-    fontWeight: "700",
-    color: "#fff",
   },
   /* RAG chat */
   chatScroll: {
@@ -1186,23 +1214,16 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   directionsSection: {
-    gap: 8,
+    gap: 6,
     marginTop: 4,
   },
-  directionsLoadingRow: {
+  directionsSummaryBar: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    justifyContent: "center",
-  },
-  directionsLoadingText: {
-    color: "#aaa",
-    fontSize: 13,
-  },
-  directionsErrorText: {
-    color: "#e67e22",
-    fontSize: 12,
-    textAlign: "center",
+    backgroundColor: "#1a1a2e",
+    borderRadius: 12,
+    padding: 12,
+    gap: 10,
   },
   directionsMetaRow: {
     backgroundColor: "#1a1a2e",
@@ -1212,38 +1233,54 @@ const styles = StyleSheet.create({
   },
   directionsSummary: {
     color: "#fff",
-    fontWeight: "600",
-    fontSize: 14,
+    fontWeight: "700",
+    fontSize: 15,
   },
   directionsEta: {
     color: "#aaa",
-    fontSize: 13,
+    fontSize: 12,
+    marginTop: 2,
   },
   openMapsBtn: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
+    gap: 4,
     backgroundColor: "#2d6cdf",
-    borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    borderRadius: 8,
+    paddingVertical: 7,
+    paddingHorizontal: 10,
   },
   openMapsBtnText: {
     color: "#fff",
     fontWeight: "700",
-    fontSize: 14,
+    fontSize: 13,
   },
   directionsScroll: {
-    maxHeight: 220,
+    maxHeight: 200,
   },
   directionStep: {
     flexDirection: "row",
     alignItems: "flex-start",
     gap: 10,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#2a2a3e",
+    paddingVertical: 2,
+  },
+  directionStepLeft: {
+    alignItems: "center",
+    width: 24,
+    paddingTop: 2,
+  },
+  directionStepDot: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  directionStepLine: {
+    width: 2,
+    flex: 1,
+    minHeight: 16,
+    marginTop: 2,
   },
   directionStepIdx: {
     fontWeight: "800",
@@ -1252,7 +1289,8 @@ const styles = StyleSheet.create({
   },
   directionStepBody: {
     flex: 1,
-    gap: 4,
+    paddingBottom: 12,
+    gap: 2,
   },
   directionStepText: {
     color: "#eee",
@@ -1274,8 +1312,6 @@ export default function App() {
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [location, setLocation] = useState<Coord | null>(null);
-  const [googleApiRequestCount, setGoogleApiRequestCount] = useState(0);
-  const [googleApiBlocked, setGoogleApiBlocked] = useState(false);
 
   const baseURL = normalizeGatewayUrl(gatewayIP);
 
@@ -1290,25 +1326,6 @@ export default function App() {
         longitude: loc.coords.longitude,
       });
     })();
-  }, []);
-
-  const loadGoogleApiQuota = useCallback(async () => {
-    const state = await getGoogleApiQuotaState();
-    setGoogleApiRequestCount(state.requestCount);
-    setGoogleApiBlocked(
-      state.blocked || state.requestCount >= GOOGLE_API_REQUEST_LIMIT,
-    );
-  }, []);
-
-  useEffect(() => {
-    void loadGoogleApiQuota();
-  }, [loadGoogleApiQuota]);
-
-  const resetGoogleApiQuota = useCallback(async () => {
-    await writeGoogleApiQuotaState({ requestCount: 0, blocked: false });
-    setGoogleApiRequestCount(0);
-    setGoogleApiBlocked(false);
-    Alert.alert("Reset complete", "Google API counter reset to 0.");
   }, []);
 
   const checkHealth = useCallback(
@@ -1370,9 +1387,6 @@ export default function App() {
     checking,
     checkHealth,
     location,
-    googleApiRequestCount,
-    googleApiBlocked,
-    resetGoogleApiQuota,
   };
 
   return (
