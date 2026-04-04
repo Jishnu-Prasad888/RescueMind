@@ -3,6 +3,7 @@ import React, {
   useEffect,
   useRef,
   useCallback,
+  useMemo,
   createContext,
   useContext,
 } from "react";
@@ -20,6 +21,7 @@ import {
   Animated,
   Dimensions,
   StatusBar,
+  Linking,
 } from "react-native";
 import {
   SafeAreaProvider,
@@ -27,16 +29,16 @@ import {
   useSafeAreaInsets,
 } from "react-native-safe-area-context";
 import * as Location from "expo-location";
+import Constants from "expo-constants";
 import MapView, {
   Polyline,
   Marker,
-  PROVIDER_GOOGLE,
+  UrlTile,
   LatLng,
+  MAP_TYPES,
 } from "react-native-maps";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
-import Constants from "expo-constants";
-import * as FileSystem from "expo-file-system/legacy";
 
 /* ───────────────── TYPES ───────────────── */
 
@@ -54,14 +56,12 @@ type Step = {
   startLng: number;
 };
 
-type GoogleRoute = {
-  index: number;
+type TurnByTurnRoute = {
   summary: string;
   distance: string;
   duration: string;
   distanceM: number;
   durationS: number;
-  polyline: LatLng[];
   steps: Step[];
 };
 
@@ -82,7 +82,7 @@ type NearestLocation = {
 /**
  * /nearest returns { nearest_location: string, distance_km: number }.
  * If the response has no numeric lat/lon we geocode the place name via
- * the Google Maps Geocoding API to obtain coordinates.
+ * OpenStreetMap Nominatim to obtain coordinates.
  */
 async function resolveNearestLocation(data: any): Promise<NearestLocation> {
   // Happy path — server already gave us coordinates
@@ -126,9 +126,7 @@ async function resolveNearestLocation(data: any): Promise<NearestLocation> {
     `?q=${encodeURIComponent(placeName)}` +
     `&format=json&limit=1`;
 
-  const res = await fetch(nominatimUrl, {
-    headers: { "User-Agent": "RescueMindApp/1.0" },
-  });
+  const res = await fetch(nominatimUrl, { headers: nominatimHeaders() });
   const json = await res.json();
 
   if (!Array.isArray(json) || json.length === 0) {
@@ -163,9 +161,6 @@ type AppContextType = {
   checking: boolean;
   checkHealth: (ip?: string) => void;
   location: Coord | null;
-  googleApiRequestCount: number;
-  googleApiBlocked: boolean;
-  resetGoogleApiQuota: () => Promise<void>;
 };
 
 /* ───────────────── CONTEXT ───────────────── */
@@ -173,51 +168,208 @@ type AppContextType = {
 const AppContext = createContext<AppContextType>({} as AppContextType);
 const useApp = () => useContext(AppContext);
 
-/* ───────────────── CONFIG ───────────────── */
-
-const GMAPS_KEY =
-  Constants.expoConfig?.extra?.googleMapsApiKey ??
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ??
-  "";
-const GOOGLE_API_REQUEST_LIMIT = 500;
-const GOOGLE_API_QUOTA_FILE =
-  (FileSystem.documentDirectory ?? "") + "google-api-quota.json";
-
 /* ───────────────── UTILS ───────────────── */
 
-function decodePolyline(encoded: string): LatLng[] {
-  let index = 0,
-    lat = 0,
-    lng = 0;
-  const result: LatLng[] = [];
+/** ~50 km/h — rough segment times for path-based directions only */
+const ASSUMED_SPEED_MPS = 50 / 3.6;
 
-  while (index < encoded.length) {
-    let b,
-      shift = 0,
-      result_ = 0;
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result_ |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+/**
+ * Do not use tile.openstreetmap.org in mobile apps: native tile requests cannot
+ * set a compliant User-Agent, so OSMF often blocks them. CARTO basemaps are
+ * OSM-based and suited for app use (still attribute OSM + CARTO).
+ */
+const RASTER_TILE_URL =
+  "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png";
 
-    lat += result_ & 1 ? ~(result_ >> 1) : result_ >> 1;
+/** https://operations.osmfoundation.org/policies/nominatim/ */
+function nominatimHeaders(): Record<string, string> {
+  const id =
+    Constants.expoConfig?.android?.package ??
+    Constants.expoConfig?.ios?.bundleIdentifier ??
+    "com.rescuemind.app";
+  const contactUrl = process.env.EXPO_PUBLIC_NOMINATIM_CONTACT?.trim();
+  const ua = contactUrl
+    ? `RescueMind/1.0 (${id}; ${contactUrl})`
+    : `RescueMind/1.0 (${id})`;
+  const h: Record<string, string> = { "User-Agent": ua };
+  const from = process.env.EXPO_PUBLIC_NOMINATIM_FROM_EMAIL?.trim();
+  if (from) h.From = from;
+  return h;
+}
 
-    shift = 0;
-    result_ = 0;
+function formatDistanceM(m: number): string {
+  if (!Number.isFinite(m) || m < 0) return "—";
+  if (m < 1000) return `${Math.round(m)} m`;
+  return `${(m / 1000).toFixed(2)} km`;
+}
 
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result_ |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+function formatDurationS(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `${h} h ${mm} min`;
+  }
+  if (m === 0) return `${s} s`;
+  return `${m} min ${s} s`;
+}
 
-    lng += result_ & 1 ? ~(result_ >> 1) : result_ >> 1;
+function haversineM(a: Coord, b: Coord): number {
+  const R = 6371000;
+  const φ1 = (a.latitude * Math.PI) / 180;
+  const φ2 = (b.latitude * Math.PI) / 180;
+  const Δφ = ((b.latitude - a.latitude) * Math.PI) / 180;
+  const Δλ = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const s =
+    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
 
-    result.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
+function bearingDeg(a: Coord, b: Coord): number {
+  const φ1 = (a.latitude * Math.PI) / 180;
+  const φ2 = (b.latitude * Math.PI) / 180;
+  const Δλ = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x =
+    Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  let θ = (Math.atan2(y, x) * 180) / Math.PI;
+  return (θ + 360) % 360;
+}
+
+function angleDiffDeg(from: number, to: number): number {
+  return ((to - from + 540) % 360) - 180;
+}
+
+function cardinal8(deg: number): string {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return dirs[Math.round(deg / 45) % 8];
+}
+
+function turnPhrase(delta: number): string | null {
+  const abs = Math.abs(delta);
+  if (abs < 22) return null;
+  const dir = delta > 0 ? "right" : "left";
+  if (abs < 45) return `Bear slightly ${dir}`;
+  if (abs < 130) return `Turn ${dir}`;
+  if (abs < 170) return `Turn sharp ${dir}`;
+  return `Make a U-turn to the ${dir}`;
+}
+
+/**
+ * Turn-by-turn cues derived from the backend route polyline so the line on the map
+ * and the steps stay aligned for each tab (FASTEST / SAFEST / SHORTEST).
+ */
+function buildDirectionsFromPath(
+  path: { lat: number; lon: number }[],
+  distanceM: number,
+  durationS: number,
+  modeLabel: string,
+): TurnByTurnRoute {
+  const pts: Coord[] = path.map((p) => ({
+    latitude: p.lat,
+    longitude: p.lon,
+  }));
+
+  if (pts.length < 2) {
+    return {
+      summary: `${modeLabel} · route`,
+      distance: formatDistanceM(distanceM),
+      duration: formatDurationS(durationS),
+      distanceM,
+      durationS,
+      steps: [
+        {
+          instruction: "You are already at the destination.",
+          distance: "—",
+          duration: "—",
+          startLat: pts[0]?.latitude ?? 0,
+          startLng: pts[0]?.longitude ?? 0,
+        },
+      ],
+    };
   }
 
-  return result;
+  const steps: Step[] = [];
+  let runM = 0;
+  let runStart: Coord = pts[0];
+
+  const pushContinue = (meters: number, at: Coord) => {
+    if (meters < 20) return;
+    const sec = meters / ASSUMED_SPEED_MPS;
+    steps.push({
+      instruction: `Continue along the route for ${formatDistanceM(meters)}`,
+      distance: formatDistanceM(meters),
+      duration: formatDurationS(sec),
+      startLat: at.latitude,
+      startLng: at.longitude,
+    });
+  };
+
+  steps.push({
+    instruction: `Head ${cardinal8(bearingDeg(pts[0], pts[1]))} along the highlighted route`,
+    distance: "—",
+    duration: "—",
+    startLat: pts[0].latitude,
+    startLng: pts[0].longitude,
+  });
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const brgIn = bearingDeg(pts[i - 1], pts[i]);
+    const brgOut = bearingDeg(pts[i], pts[i + 1]);
+    const segM = haversineM(pts[i - 1], pts[i]);
+    runM += segM;
+    const phrase = turnPhrase(angleDiffDeg(brgIn, brgOut));
+    if (phrase) {
+      pushContinue(runM, runStart);
+      runM = 0;
+      runStart = pts[i];
+      steps.push({
+        instruction: phrase,
+        distance: "—",
+        duration: "—",
+        maneuver: phrase,
+        startLat: pts[i].latitude,
+        startLng: pts[i].longitude,
+      });
+    }
+  }
+
+  runM += haversineM(pts[pts.length - 2], pts[pts.length - 1]);
+  pushContinue(runM, runStart);
+
+  const last = pts[pts.length - 1];
+  const finLeg = haversineM(pts[pts.length - 2], last);
+  steps.push({
+    instruction: "Arrive at your destination",
+    distance: formatDistanceM(finLeg),
+    duration: formatDurationS(finLeg / ASSUMED_SPEED_MPS),
+    startLat: last.latitude,
+    startLng: last.longitude,
+  });
+
+  return {
+    summary: `${modeLabel} · RescueMind graph route`,
+    distance: formatDistanceM(distanceM),
+    duration: formatDurationS(durationS),
+    distanceM,
+    durationS,
+    steps,
+  };
+}
+
+function openDirectionsInOpenStreetMap(
+  origin: Coord,
+  destination: Coord,
+): void {
+  const o = `${origin.latitude},${origin.longitude}`;
+  const d = `${destination.latitude},${destination.longitude}`;
+  const url = `https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${encodeURIComponent(o)}%3B${encodeURIComponent(d)}`;
+  Linking.openURL(url).catch(() => {
+    Alert.alert("Could not open maps", "No app available to handle the link.");
+  });
 }
 
 function normalizeGatewayUrl(value: string): string {
@@ -227,137 +379,12 @@ function normalizeGatewayUrl(value: string): string {
   return `http://${trimmed}`;
 }
 
-type GoogleApiQuotaState = {
-  requestCount: number;
-  blocked: boolean;
-};
-
-async function writeGoogleApiQuotaState(
-  state: GoogleApiQuotaState,
-): Promise<void> {
-  await FileSystem.writeAsStringAsync(
-    GOOGLE_API_QUOTA_FILE,
-    JSON.stringify(state),
-  );
-}
-
-async function getGoogleApiQuotaState(): Promise<{
-  requestCount: number;
-  blocked: boolean;
-}> {
-  try {
-    if (!FileSystem.documentDirectory) {
-      return { requestCount: 0, blocked: false };
-    }
-
-    const fileInfo = await FileSystem.getInfoAsync(GOOGLE_API_QUOTA_FILE);
-    if (!fileInfo.exists) {
-      return { requestCount: 0, blocked: false };
-    }
-
-    const raw = await FileSystem.readAsStringAsync(GOOGLE_API_QUOTA_FILE);
-    const parsed = JSON.parse(raw) as Partial<GoogleApiQuotaState>;
-    const requestCount =
-      typeof parsed.requestCount === "number" &&
-      Number.isFinite(parsed.requestCount)
-        ? parsed.requestCount
-        : 0;
-    const blocked = parsed.blocked === true;
-
-    return { requestCount, blocked };
-  } catch {
-    return { requestCount: 0, blocked: false };
-  }
-}
-
-async function setGoogleApiBlocked(blocked: boolean): Promise<void> {
-  const state = await getGoogleApiQuotaState();
-  await writeGoogleApiQuotaState({ ...state, blocked });
-}
-
-async function assertGoogleApiCallAllowed() {
-  const state = await getGoogleApiQuotaState();
-
-  if (state.blocked || state.requestCount >= GOOGLE_API_REQUEST_LIMIT) {
-    await setGoogleApiBlocked(true);
-    Alert.alert(
-      "Google API limit reached",
-      "Maximum 500 requests reached. Google API calls are blocked until you manually reset the counter.",
-    );
-    throw new Error("GOOGLE_API_LIMIT_REACHED");
-  }
-}
-
-async function incrementGoogleApiRequestCounter(): Promise<number> {
-  const state = await getGoogleApiQuotaState();
-  const nextCount = state.requestCount + 1;
-  const shouldBlock = nextCount >= GOOGLE_API_REQUEST_LIMIT;
-
-  await writeGoogleApiQuotaState({
-    requestCount: nextCount,
-    blocked: shouldBlock,
-  });
-
-  if (shouldBlock) {
-    Alert.alert(
-      "Google API limit reached",
-      "Maximum 500 requests reached. Google API calls are now blocked until you manually reset the counter.",
-    );
-  }
-
-  return nextCount;
-}
-
-/* ───────────────── GOOGLE DIRECTIONS ───────────────── */
-
-async function fetchGoogleDirections(
-  origin: Coord,
-  destination: Coord,
-): Promise<GoogleRoute[]> {
-  await assertGoogleApiCallAllowed();
-
-  const url =
-    `https://maps.googleapis.com/maps/api/directions/json` +
-    `?origin=${origin.latitude},${origin.longitude}` +
-    `&destination=${destination.latitude},${destination.longitude}` +
-    `&alternatives=true` +
-    `&key=${GMAPS_KEY}`;
-
-  const res = await fetch(url);
-  const data = await res.json();
-  await incrementGoogleApiRequestCounter();
-
-  if (data.status !== "OK") throw new Error(data.status);
-
-  return data.routes.map(
-    (r: any, i: number): GoogleRoute => ({
-      index: i,
-      summary: r.summary,
-      distance: r.legs[0].distance.text,
-      duration: r.legs[0].duration.text,
-      distanceM: r.legs[0].distance.value,
-      durationS: r.legs[0].duration.value,
-      polyline: decodePolyline(r.overview_polyline.points),
-      steps: r.legs[0].steps.map(
-        (s: any): Step => ({
-          instruction: s.html_instructions.replace(/<[^>]*>/g, ""),
-          distance: s.distance.text,
-          duration: s.duration.text,
-          maneuver: s.maneuver,
-          startLat: s.start_location.lat,
-          startLng: s.start_location.lng,
-        }),
-      ),
-    }),
-  );
-}
-
 /* ───────────────── ROUTE COLORS ───────────────── */
 
 const ROUTE_COLORS: Record<ServerRoute["type"], string> = {
-  FASTEST: "#FF6B35", // orange
-  SAFEST: "#2EC4B6", // teal
-  SHORTEST: "#9B59B6", // purple
+  FASTEST: "#4285F4", // Google Maps blue
+  SAFEST: "#34A853", // Google Maps green
+  SHORTEST: "#9B59B6",
 };
 
 const ROUTE_LABELS: Record<ServerRoute["type"], string> = {
@@ -369,16 +396,8 @@ const ROUTE_LABELS: Record<ServerRoute["type"], string> = {
 /* ───────────────── SCREENS ───────────────── */
 
 function ConfigScreen() {
-  const {
-    gatewayIP,
-    setGatewayIP,
-    checkHealth,
-    healthStatus,
-    checking,
-    googleApiRequestCount,
-    googleApiBlocked,
-    resetGoogleApiQuota,
-  } = useApp();
+  const { gatewayIP, setGatewayIP, checkHealth, healthStatus, checking } =
+    useApp();
   const [draft, setDraft] = useState(gatewayIP);
 
   const dot = (val: boolean | null) =>
@@ -429,36 +448,6 @@ function ConfigScreen() {
             </Text>
           </View>
         )}
-
-        <View style={styles.divider} />
-
-        <Text style={styles.heading}>Google Maps API</Text>
-        <View style={styles.quotaCard}>
-          <Text style={styles.quotaText}>
-            Requests used:{" "}
-            <Text style={styles.quotaBold}>
-              {googleApiRequestCount} / {GOOGLE_API_REQUEST_LIMIT}
-            </Text>
-          </Text>
-          <Text style={styles.quotaText}>
-            Status:{" "}
-            <Text
-              style={[
-                styles.quotaBold,
-                { color: googleApiBlocked ? "#e74c3c" : "#2ecc71" },
-              ]}
-            >
-              {googleApiBlocked ? "Blocked" : "Active"}
-            </Text>
-          </Text>
-        </View>
-
-        <TouchableOpacity
-          style={[styles.primaryBtn, { backgroundColor: "#555" }]}
-          onPress={resetGoogleApiQuota}
-        >
-          <Text style={styles.primaryBtnText}>Reset API Counter</Text>
-        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -571,15 +560,34 @@ function RouteScreen() {
   const [loadingRoutes, setLoadingRoutes] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Derived: selected route polyline
   const selectedRoute =
     routes.find((r) => r.type === selectedType) ?? routes[0] ?? null;
 
-  const selectedPolyline: LatLng[] = selectedRoute
-    ? selectedRoute.path.map((p) => ({ latitude: p.lat, longitude: p.lon }))
-    : [];
+  const turnByTurn = useMemo((): TurnByTurnRoute | null => {
+    if (!selectedRoute || selectedRoute.path.length < 2) return null;
+    return buildDirectionsFromPath(
+      selectedRoute.path,
+      selectedRoute.distance,
+      selectedRoute.time,
+      ROUTE_LABELS[selectedRoute.type],
+    );
+  }, [selectedRoute]);
 
-  // Step 1: fetch nearest location from server
+  // Re-fit + re-project when selected tab changes
+  useEffect(() => {
+    if (!routes.length || !mapRef.current) return;
+    const route = routes.find((r) => r.type === selectedType);
+    if (!route || route.path.length < 2) return;
+    const coords: LatLng[] = route.path.map((p) => ({
+      latitude: p.lat,
+      longitude: p.lon,
+    }));
+    mapRef.current.fitToCoordinates(coords, {
+      edgePadding: { top: 80, right: 40, bottom: 320, left: 40 },
+      animated: true,
+    });
+  }, [selectedType, routes]);
+
   const fetchNearest = useCallback(async () => {
     if (!location || !baseURL) {
       setError("Location or gateway not available.");
@@ -606,7 +614,6 @@ function RouteScreen() {
     }
   }, [location, baseURL]);
 
-  // Step 2: fetch routes once we have nearest
   const fetchRoutes = useCallback(async () => {
     if (!location || !nearest || !baseURL) return;
     setError(null);
@@ -628,7 +635,6 @@ function RouteScreen() {
       setRoutes(data.routes ?? []);
       if (data.routes?.length) setSelectedType(data.routes[0].type);
 
-      // Fit map to show full route
       const allCoords: LatLng[] = data.routes.flatMap((r) =>
         r.path.map((p) => ({ latitude: p.lat, longitude: p.lon })),
       );
@@ -646,7 +652,6 @@ function RouteScreen() {
     }
   }, [location, nearest, baseURL]);
 
-  // Auto-fetch routes when nearest changes
   useEffect(() => {
     if (nearest) fetchRoutes();
   }, [nearest]);
@@ -657,9 +662,9 @@ function RouteScreen() {
     <View style={{ flex: 1 }}>
       <MapView
         ref={mapRef}
-        provider={PROVIDER_GOOGLE}
         style={{ flex: 1 }}
         showsUserLocation
+        mapType={MAP_TYPES.STANDARD}
         initialRegion={{
           latitude: location?.latitude ?? 18.5274,
           longitude: location?.longitude ?? 73.8732,
@@ -667,42 +672,62 @@ function RouteScreen() {
           longitudeDelta: 0.05,
         }}
       >
-        {/* All routes (dimmed) */}
-        {routes.map((r) => {
-          const coords = r.path.map((p) => ({
+        {/* Inactive routes */}
+        {routes
+          .filter((r) => r.type !== selectedType)
+          .map((r) => (
+            <Polyline
+              key={r.type}
+              coordinates={r.path.map((p) => ({
+                latitude: p.lat,
+                longitude: p.lon,
+              }))}
+              strokeColor="rgba(180,180,200,0.4)"
+              strokeWidth={3}
+              lineDashPattern={[8, 6]}
+            />
+          ))}
+
+        {(() => {
+          const active = routes.find((r) => r.type === selectedType);
+          if (!active) return null;
+          const coords = active.path.map((p) => ({
             latitude: p.lat,
             longitude: p.lon,
           }));
-          const isSelected = r.type === selectedType;
           return (
-            <Polyline
-              key={r.type}
-              coordinates={coords}
-              strokeColor={isSelected ? ROUTE_COLORS[r.type] : "#ccc"}
-              strokeWidth={isSelected ? 5 : 2}
-              zIndex={isSelected ? 10 : 1}
-            />
+            <>
+              <Polyline
+                coordinates={coords}
+                strokeColor="rgba(255,255,255,0.92)"
+                strokeWidth={12}
+                zIndex={9}
+                geodesic
+              />
+              <Polyline
+                coordinates={coords}
+                strokeColor="#0099ff"
+                strokeWidth={7}
+                zIndex={10}
+                geodesic
+              />
+            </>
           );
-        })}
+        })()}
 
-        {/* Nearest location marker */}
-        {nearest &&
-          typeof nearest.lat === "number" &&
-          typeof nearest.lon === "number" && (
-            <Marker
-              coordinate={{ latitude: nearest.lat, longitude: nearest.lon }}
-              title={nearest.name ?? "Nearest Location"}
-              description={`${nearest.lat.toFixed(5)}, ${nearest.lon.toFixed(5)}`}
-              pinColor="#FF6B35"
-            />
-          )}
+        {nearest && typeof nearest.lat === "number" && (
+          <Marker
+            coordinate={{ latitude: nearest.lat, longitude: nearest.lon }}
+            title={nearest.name ?? "Nearest Location"}
+            pinColor="#FF6B35"
+          />
+        )}
       </MapView>
 
-      {/* Overlay panel */}
+      {/* Bottom panel — completely unchanged */}
       <View style={styles.routePanel}>
         {error && <Text style={styles.errorText}>{error}</Text>}
 
-        {/* Route type selector */}
         {routes.length > 0 && (
           <ScrollView
             horizontal
@@ -744,7 +769,101 @@ function RouteScreen() {
           </ScrollView>
         )}
 
-        {/* Nearest info */}
+        {routes.length > 0 && location && nearest && turnByTurn ? (
+          <View style={styles.directionsSection}>
+            <View style={styles.directionsSummaryBar}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.directionsSummary} numberOfLines={1}>
+                  {ROUTE_LABELS[selectedType]}
+                </Text>
+                <Text style={styles.directionsEta}>
+                  {turnByTurn.duration} · {turnByTurn.distance}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.openMapsBtn}
+                onPress={() =>
+                  openDirectionsInOpenStreetMap(location, {
+                    latitude: nearest.lat,
+                    longitude: nearest.lon,
+                  })
+                }
+              >
+                <Ionicons name="open-outline" size={16} color="#fff" />
+                <Text style={styles.openMapsBtnText}>OSM</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              style={styles.directionsScroll}
+              nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {turnByTurn.steps.map((step, i) => {
+                const isLast = i === turnByTurn.steps.length - 1;
+                const icon = isLast
+                  ? "flag"
+                  : step.maneuver?.toLowerCase().includes("left")
+                    ? "arrow-back"
+                    : step.maneuver?.toLowerCase().includes("right")
+                      ? "arrow-forward"
+                      : step.maneuver?.toLowerCase().includes("u-turn")
+                        ? "return-up-back"
+                        : i === 0
+                          ? "navigate"
+                          : "arrow-up";
+                return (
+                  <View
+                    key={`${step.startLat}-${step.startLng}-${i}`}
+                    style={styles.directionStep}
+                  >
+                    <View style={styles.directionStepLeft}>
+                      <View
+                        style={[
+                          styles.directionStepDot,
+                          {
+                            backgroundColor: isLast
+                              ? "#e74c3c"
+                              : ROUTE_COLORS[selectedType],
+                          },
+                        ]}
+                      >
+                        <Ionicons name={icon as any} size={12} color="#fff" />
+                      </View>
+                      {!isLast && (
+                        <View
+                          style={[
+                            styles.directionStepLine,
+                            {
+                              backgroundColor:
+                                ROUTE_COLORS[selectedType] + "55",
+                            },
+                          ]}
+                        />
+                      )}
+                    </View>
+                    <View style={styles.directionStepBody}>
+                      <Text style={styles.directionStepText}>
+                        {step.instruction}
+                      </Text>
+                      {(step.distance !== "—" || step.duration !== "—") && (
+                        <Text style={styles.directionStepMeta}>
+                          {step.distance !== "—" ? step.distance : ""}
+                          {step.distance !== "—" && step.duration !== "—"
+                            ? "  ·  "
+                            : ""}
+                          {step.duration !== "—" ? step.duration : ""}
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+          </View>
+        ) : null}
+
         {nearest && (
           <View style={styles.nearestInfo}>
             <Text style={styles.nearestTitle}>
@@ -760,7 +879,6 @@ function RouteScreen() {
           </View>
         )}
 
-        {/* Action button */}
         <TouchableOpacity
           style={[styles.primaryBtn, { marginTop: 8 }]}
           onPress={fetchNearest}
@@ -850,26 +968,6 @@ const styles = StyleSheet.create({
   healthRow: {
     color: "#ccc",
     fontSize: 14,
-  },
-  divider: {
-    height: 1,
-    backgroundColor: "#222",
-    marginVertical: 20,
-  },
-  quotaCard: {
-    backgroundColor: "#1a1a2e",
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 12,
-    gap: 6,
-  },
-  quotaText: {
-    color: "#ccc",
-    fontSize: 14,
-  },
-  quotaBold: {
-    fontWeight: "700",
-    color: "#fff",
   },
   /* RAG chat */
   chatScroll: {
@@ -991,6 +1089,94 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: "center",
   },
+  directionsSection: {
+    gap: 6,
+    marginTop: 4,
+  },
+  directionsSummaryBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#1a1a2e",
+    borderRadius: 12,
+    padding: 12,
+    gap: 10,
+  },
+  directionsMetaRow: {
+    backgroundColor: "#1a1a2e",
+    borderRadius: 10,
+    padding: 10,
+    gap: 4,
+  },
+  directionsSummary: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 15,
+  },
+  directionsEta: {
+    color: "#aaa",
+    fontSize: 12,
+    marginTop: 2,
+  },
+  openMapsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#2d6cdf",
+    borderRadius: 8,
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+  },
+  openMapsBtnText: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 13,
+  },
+  directionsScroll: {
+    maxHeight: 200,
+  },
+  directionStep: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+    paddingVertical: 2,
+  },
+  directionStepLeft: {
+    alignItems: "center",
+    width: 24,
+    paddingTop: 2,
+  },
+  directionStepDot: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  directionStepLine: {
+    width: 2,
+    flex: 1,
+    minHeight: 16,
+    marginTop: 2,
+  },
+  directionStepIdx: {
+    fontWeight: "800",
+    fontSize: 13,
+    minWidth: 22,
+  },
+  directionStepBody: {
+    flex: 1,
+    paddingBottom: 12,
+    gap: 2,
+  },
+  directionStepText: {
+    color: "#eee",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  directionStepMeta: {
+    color: "#888",
+    fontSize: 12,
+  },
 });
 
 /* ───────────────── ROOT ───────────────── */
@@ -1002,8 +1188,6 @@ export default function App() {
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [location, setLocation] = useState<Coord | null>(null);
-  const [googleApiRequestCount, setGoogleApiRequestCount] = useState(0);
-  const [googleApiBlocked, setGoogleApiBlocked] = useState(false);
 
   const baseURL = normalizeGatewayUrl(gatewayIP);
 
@@ -1020,25 +1204,6 @@ export default function App() {
     })();
   }, []);
 
-  const loadGoogleApiQuota = useCallback(async () => {
-    const state = await getGoogleApiQuotaState();
-    setGoogleApiRequestCount(state.requestCount);
-    setGoogleApiBlocked(
-      state.blocked || state.requestCount >= GOOGLE_API_REQUEST_LIMIT,
-    );
-  }, []);
-
-  useEffect(() => {
-    void loadGoogleApiQuota();
-  }, [loadGoogleApiQuota]);
-
-  const resetGoogleApiQuota = useCallback(async () => {
-    await writeGoogleApiQuotaState({ requestCount: 0, blocked: false });
-    setGoogleApiRequestCount(0);
-    setGoogleApiBlocked(false);
-    Alert.alert("Reset complete", "Google API counter reset to 0.");
-  }, []);
-
   const checkHealth = useCallback(
     async (ip?: string) => {
       const url = ip ? normalizeGatewayUrl(ip) : baseURL;
@@ -1047,12 +1212,39 @@ export default function App() {
       setChecking(true);
       try {
         const res = await fetch(`${url}/health`);
-        const data = await res.json();
+        const data: any = await res.json().catch(() => null);
+
+        const parseOk = (value: any): boolean => {
+          if (typeof value === "boolean") return value;
+          if (typeof value === "string") return value.toLowerCase() === "ok";
+          if (value && typeof value === "object") {
+            const status =
+              value.status ?? value.state ?? value.health ?? value.result;
+            return typeof status === "string"
+              ? status.toLowerCase() === "ok"
+              : typeof status === "boolean"
+                ? status
+                : false;
+          }
+          return false;
+        };
+
+        const hasField = (obj: any, key: string) =>
+          obj && Object.prototype.hasOwnProperty.call(obj, key);
+
+        const gatewayRaw = data?.gateway;
+        const gateway =
+          hasField(data, "gateway") && typeof gatewayRaw === "string"
+            ? gatewayRaw.toLowerCase() === "ok" ||
+              gatewayRaw.toLowerCase() === "up"
+            : hasField(data, "gateway")
+              ? parseOk(gatewayRaw)
+              : null;
 
         setHealthStatus({
-          gateway: true,
-          rag: data.rag === "ok",
-          graph: data.graph === "ok",
+          gateway,
+          rag: hasField(data, "rag") ? parseOk(data.rag) : null,
+          graph: hasField(data, "graph") ? parseOk(data.graph) : null,
         });
       } catch {
         setHealthStatus({ gateway: false, rag: null, graph: null });
@@ -1071,9 +1263,6 @@ export default function App() {
     checking,
     checkHealth,
     location,
-    googleApiRequestCount,
-    googleApiBlocked,
-    resetGoogleApiQuota,
   };
 
   return (
