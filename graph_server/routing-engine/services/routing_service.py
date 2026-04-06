@@ -1,6 +1,8 @@
 from graph.load_geojson import load_geojson
 from graph.build_graph import build_city_graph
 from graph.kd_tree import NodeKDTree
+from graph.graph_updater import update_graph_safety_weights
+from services.ml_provider import MLProvider
 
 from algorithms.astar import find_route
 import networkx as nx
@@ -20,19 +22,45 @@ class RoutingService:
         print("Nodes:", len(self.G.nodes))
         print("Edges:", len(self.G.edges))
 
-        # Add dummy weights for testing multi-route
+        # Add dummy time weights for testing multi-route
         for u, v, data in self.G.edges(data=True):
             if 'time' not in data:
                 # Assuming weight is distance, time = distance / speed
                 data['time'] = data.get('weight', 1.0) / random.uniform(20.0, 60.0)
-            if 'safety' not in data:
-                # Random safety penalty
-                data['safety'] = data.get('weight', 1.0) * random.uniform(0.5, 2.0)
 
-        print("Dummy time and safety weights added.")
+        # Initialize ML Provider and attempt to overlay hazard matrix
+        self.ml_provider = MLProvider()
+        
+        # We try to load the default matrix from CSV if available locally
+        if self.ml_provider.load_from_csv("data/blurred_matrix.csv"):
+            self.ml_provider.compute_bounds(self.G)
+            self._apply_ml_safety_weights()
+            print("ML hazard matrix loaded and safety weights applied successfully.")
+        else:
+            # Fallback to dummy safety weights if no ML data exists
+            for u, v, data in self.G.edges(data=True):
+                if 'safety' not in data:
+                    data['safety'] = data.get('weight', 1.0) * random.uniform(0.5, 2.0)
+            print("No ML matrix found, dummy safety weights added.")
 
         # Build KD-tree
         self.kd_tree = NodeKDTree(self.G)
+
+    def _apply_ml_safety_weights(self):
+        """Helper to re-run graph updater when matrix changes."""
+        update_graph_safety_weights(
+            self.G, 
+            self.ml_provider.get_matrix(), 
+            self.ml_provider.top_left_lat, 
+            self.ml_provider.top_left_lon, 
+            self.ml_provider.lat_step, 
+            self.ml_provider.lon_step
+        )
+
+    def update_ml_matrix(self, rows):
+        """Update the live matrix from gRPC and recompute safety weights."""
+        self.ml_provider.update_matrix(rows)
+        self._apply_ml_safety_weights()
 
     def compute_route(self, start_lat, start_lon, end_lat, end_lon):
 
