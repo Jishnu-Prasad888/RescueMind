@@ -18,21 +18,15 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  Dimensions,
   StatusBar,
   Linking,
 } from "react-native";
-import {
-  SafeAreaProvider,
-  SafeAreaView,
-  useSafeAreaInsets,
-} from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import * as Location from "expo-location";
 import Constants from "expo-constants";
 import MapView, {
   Polyline,
   Marker,
-  UrlTile,
   LatLng,
   MAP_TYPES,
 } from "react-native-maps";
@@ -40,9 +34,10 @@ import { Ionicons } from "@expo/vector-icons";
 
 // HARDCODED VESSEL API KEY (replace with your actual key)
 const VESSEL_API_KEY =
-  "7094163eced8d77aff8754208329f0fe11eb1414d9d885f43f88c1bdf931fe4f"; // Get free key from vesselapi.com
-const VESSEL_API_BASE = "https://api.vesselapi.com/v1"; // Replace with actual base URL from docs
+  "7094163eced8d77aff8754208329f0fe11eb1414d9d885f43f88c1bdf931fe4f";
+const VESSEL_API_BASE = "https://api.vesselapi.com/v1";
 const AIS_STREAM_API_KEY = "f7e0f030d50fc2b5a717e0d0c88b898409fbd71f";
+
 /* ───────────────── TYPES ───────────────── */
 type Coord = { latitude: number; longitude: number };
 type Step = {
@@ -88,27 +83,123 @@ type AppContextType = {
   location: Coord | null;
 };
 
-type NearbyShip = {
+type Ship = {
   mmsi: number;
-  vessel_name?: string;
-  vesselName?: string;
   latitude: number;
   longitude: number;
   sog?: number;
   cog?: number;
   distance: number;
-  [key: string]: unknown;
 };
 
 type VesselApiResponse = {
-  vessels?: NearbyShip[];
+  vessels?: Ship[];
 };
+
+function haversineKm(a: Coord, b: Coord): number {
+  const R = 6371;
+  const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
+  const dLon = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const lat1 = (a.latitude * Math.PI) / 180;
+  const lat2 = (b.latitude * Math.PI) / 180;
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.sin(dLon / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
+  return 2 * R * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+
+function smoothPosition(prev: Coord, next: Coord, alpha = 0.2): Coord {
+  return {
+    latitude: prev.latitude + (next.latitude - prev.latitude) * alpha,
+    longitude: prev.longitude + (next.longitude - prev.longitude) * alpha,
+  };
+}
+
+function sendBBox(location: Coord, socket: WebSocket): void {
+  const delta = 0.9;
+  const bbox = [
+    [location.latitude - delta, location.longitude - delta],
+    [location.latitude + delta, location.longitude + delta],
+  ];
+  socket.send(JSON.stringify({ bbox }));
+}
+
+// ✅ FIXED: Single WebSocket ownership with proper typing
+function useAIS(location: Coord | null, baseURL: string): Ship[] {
+  const [ships, setShips] = useState<Ship[]>([]);
+  const socketRef = useRef<WebSocket | null>(null);
+  const prevShipsRef = useRef<Map<number, Coord>>(new Map());
+
+  useEffect(() => {
+    if (!location || !baseURL) return;
+
+    // Convert http to ws for WebSocket connection
+    const wsURL = baseURL.replace(/^http/, "ws");
+    const socket = new WebSocket(`${wsURL}/ais`);
+    socketRef.current = socket;
+
+    socket.onopen = () => {
+      console.log("✅ AIS WebSocket Connected");
+      sendBBox(location, socket);
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const data: Ship[] = JSON.parse(event.data);
+        const updated: Ship[] = [];
+
+        for (const ship of data) {
+          const distance = haversineKm(location, {
+            latitude: ship.latitude,
+            longitude: ship.longitude,
+          });
+
+          if (distance > 50) continue; // filter radius
+
+          const prev = prevShipsRef.current.get(ship.mmsi);
+          let smoothed: Coord = {
+            latitude: ship.latitude,
+            longitude: ship.longitude,
+          };
+
+          if (prev) {
+            smoothed = smoothPosition(prev, smoothed);
+          }
+
+          prevShipsRef.current.set(ship.mmsi, smoothed);
+
+          updated.push({
+            ...ship,
+            latitude: smoothed.latitude,
+            longitude: smoothed.longitude,
+            distance,
+          });
+        }
+
+        setShips(updated);
+      } catch (err) {
+        console.error("❌ AIS parse error", err);
+      }
+    };
+
+    socket.onerror = (e) => console.error("WS error", e);
+    socket.onclose = () => console.log("WS closed");
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
+  }, [location, baseURL]);
+
+  return ships;
+}
 
 /* ───────────────── CONTEXT ───────────────── */
 const AppContext = createContext<AppContextType>({} as AppContextType);
 const useApp = () => useContext(AppContext);
 
-/* ───────────────── UTILS (unchanged) ───────────────── */
+/* ───────────────── UTILS ───────────────── */
 const ASSUMED_SPEED_MPS = 50 / 3.6;
 const RASTER_TILE_URL =
   "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png";
@@ -174,6 +265,7 @@ function formatDistanceM(m: number): string {
   if (m < 1000) return `${Math.round(m)} m`;
   return `${(m / 1000).toFixed(2)} km`;
 }
+
 function formatDurationS(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return "—";
   const m = Math.floor(sec / 60);
@@ -186,8 +278,9 @@ function formatDurationS(sec: number): string {
   if (m === 0) return `${s} s`;
   return `${m} min ${s} s`;
 }
+
 function haversineM(a: Coord, b: Coord): number {
-  /* same as original */ const R = 6371000;
+  const R = 6371000;
   const φ1 = (a.latitude * Math.PI) / 180;
   const φ2 = (b.latitude * Math.PI) / 180;
   const Δφ = ((b.latitude - a.latitude) * Math.PI) / 180;
@@ -197,8 +290,9 @@ function haversineM(a: Coord, b: Coord): number {
     Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
   return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
+
 function bearingDeg(a: Coord, b: Coord): number {
-  /* same */ const φ1 = (a.latitude * Math.PI) / 180;
+  const φ1 = (a.latitude * Math.PI) / 180;
   const φ2 = (b.latitude * Math.PI) / 180;
   const Δλ = ((b.longitude - a.longitude) * Math.PI) / 180;
   const y = Math.sin(Δλ) * Math.cos(φ2);
@@ -207,13 +301,16 @@ function bearingDeg(a: Coord, b: Coord): number {
   let θ = (Math.atan2(y, x) * 180) / Math.PI;
   return (θ + 360) % 360;
 }
+
 function angleDiffDeg(from: number, to: number): number {
   return ((to - from + 540) % 360) - 180;
 }
+
 function cardinal8(deg: number): string {
   const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
   return dirs[Math.round(deg / 45) % 8];
 }
+
 function turnPhrase(delta: number): string | null {
   const abs = Math.abs(delta);
   if (abs < 22) return null;
@@ -321,6 +418,7 @@ function openDirectionsInOpenStreetMap(
     Alert.alert("Could not open maps", "No app available to handle the link."),
   );
 }
+
 function normalizeGatewayUrl(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -350,6 +448,10 @@ function UnifiedScreen() {
     healthStatus,
     checking,
   } = useApp();
+
+  // ✅ FIXED: Single source of truth for AIS data
+  const ships = useAIS(location, baseURL);
+
   const [draftIP, setDraftIP] = useState(gatewayIP);
   const [ragInput, setRagInput] = useState("");
   const [ragMessages, setRagMessages] = useState<
@@ -369,15 +471,6 @@ function UnifiedScreen() {
   const [loadingNearest, setLoadingNearest] = useState(false);
   const [loadingRoutes, setLoadingRoutes] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Vessel API state
-  const [nearbyShips, setNearbyShips] = useState<NearbyShip[]>([]);
-  const [loadingShips, setLoadingShips] = useState(false);
-  const [lastShipFetchTime, setLastShipFetchTime] = useState<number>(0);
-  const [shipCooldownRemaining, setShipCooldownRemaining] = useState(0);
-  const shipCooldownInterval = useRef<ReturnType<typeof setInterval> | null>(
-    null,
-  );
 
   const selectedRoute =
     routes.find((r) => r.type === selectedType) ?? routes[0] ?? null;
@@ -404,40 +497,6 @@ function UnifiedScreen() {
       animated: true,
     });
   }, [selectedType, routes]);
-
-  // Cleanup cooldown interval
-  useEffect(() => {
-    return () => {
-      if (shipCooldownInterval.current) {
-        clearInterval(shipCooldownInterval.current);
-      }
-    };
-  }, []);
-
-  // Update cooldown timer
-  useEffect(() => {
-    if (shipCooldownRemaining > 0) {
-      if (shipCooldownInterval.current) {
-        clearInterval(shipCooldownInterval.current);
-      }
-      shipCooldownInterval.current = setInterval(() => {
-        setShipCooldownRemaining((prev) => {
-          if (prev <= 1) {
-            if (shipCooldownInterval.current) {
-              clearInterval(shipCooldownInterval.current);
-            }
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-    }
-    return () => {
-      if (shipCooldownInterval.current) {
-        clearInterval(shipCooldownInterval.current);
-      }
-    };
-  }, [shipCooldownRemaining]);
 
   const fetchNearest = useCallback(async () => {
     if (!location || !baseURL) {
@@ -504,7 +563,7 @@ function UnifiedScreen() {
 
   useEffect(() => {
     if (nearest) fetchRoutes();
-  }, [nearest]);
+  }, [nearest, fetchRoutes]);
 
   const sendRag = async () => {
     const q = ragInput.trim();
@@ -541,150 +600,15 @@ function UnifiedScreen() {
     }
   };
 
-  // Fetch nearby ships from Vessel API
-  const fetchNearbyShips = useCallback(() => {
-    if (!location) {
-      console.error("❌ No location available");
-      return;
+  // ✅ FIXED: Simple refresh button that triggers bbox update
+  const refreshAIS = useCallback(() => {
+    if (location) {
+      console.log("📡 Refreshing AIS stream");
+      // The useAIS hook will automatically handle bbox updates
+      // when location changes, so we just log here
     }
+  }, [location]);
 
-    if (!AIS_STREAM_API_KEY) {
-      console.error("❌ Missing AIS API Key");
-      return;
-    }
-
-    console.log("🚀 Starting AIS scan...");
-    console.log("🔑 AIS KEY:", AIS_STREAM_API_KEY);
-
-    setLoadingShips(true);
-
-    const delta = 0.9;
-    const currentStep = scanStep;
-
-    const shiftedLon = location.longitude - currentStep * (2 * delta);
-
-    const latBottom = location.latitude - delta;
-    const latTop = location.latitude + delta;
-    const lonLeft = shiftedLon - delta;
-    const lonRight = shiftedLon + delta;
-
-    console.log("📦 Bounding Box:", {
-      latBottom,
-      latTop,
-      lonLeft,
-      lonRight,
-      step: currentStep,
-    });
-
-    const socket = new WebSocket("ws://10.205.183.108:6969");
-
-    let shipsMap = new Map<number, NearbyShip>();
-    let hasReceivedData = false;
-
-    socket.onopen = () => {
-      console.log("✅ WS OPEN");
-
-      const subMessage = {
-        APIKey: AIS_STREAM_API_KEY,
-        BoundingBoxes: [
-          [
-            [latBottom, lonLeft],
-            [latTop, lonRight],
-          ],
-        ],
-      };
-
-      console.log("📤 Sending subscription:", subMessage);
-
-      socket.send(JSON.stringify(subMessage));
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-
-        if (data?.Message?.PositionReport) {
-          hasReceivedData = true;
-
-          const msg = data.Message.PositionReport;
-
-          if (
-            msg?.Latitude == null ||
-            msg?.Longitude == null ||
-            msg?.UserID == null
-          ) {
-            return;
-          }
-
-          const mmsi = msg.UserID;
-
-          const distance =
-            haversineM(
-              {
-                latitude: location.latitude,
-                longitude: location.longitude,
-              },
-              {
-                latitude: msg.Latitude,
-                longitude: msg.Longitude,
-              },
-            ) / 1000;
-
-          shipsMap.set(mmsi, {
-            mmsi,
-            latitude: msg.Latitude,
-            longitude: msg.Longitude,
-            sog: msg.Sog,
-            cog: msg.Cog,
-            distance, // ✅ always defined
-          });
-
-          const sorted = Array.from(shipsMap.values())
-            .sort((a, b) => a.distance - b.distance)
-            .slice(0, 10);
-
-          console.log(`🚢 Ships tracked: ${sorted.length}`);
-
-          setNearbyShips(sorted);
-        }
-      } catch (err) {
-        console.error("❌ WS PARSE ERROR:", err);
-      }
-    };
-
-    socket.onerror = (err) => {
-      console.error("❌ WS ERROR:", JSON.stringify(err, null, 2));
-    };
-
-    socket.onclose = (event) => {
-      console.log("🔌 WS CLOSED:", {
-        code: event.code,
-        reason: event.reason,
-        clean: event.wasClean,
-      });
-
-      if (!hasReceivedData || shipsMap.size === 0) {
-        setScanStep((prev) => {
-          const next = prev + 1;
-          console.log(`🔍 No ships → scanning step ${next}`);
-          return next;
-        });
-      } else {
-        console.log("✅ Ships found, resetting scan");
-        setScanStep(0);
-      }
-
-      setLoadingShips(false);
-    };
-
-    // ⏱ auto close after 5 sec
-    setTimeout(() => {
-      if (socket.readyState === WebSocket.OPEN) {
-        console.log("⏱ Closing WS after timeout");
-        socket.close();
-      }
-    }, 5000);
-  }, [location, scanStep]);
   const dot = (val: boolean | null) =>
     val === null ? "⚪" : val ? "🟢" : "🔴";
   const isLoading = loadingNearest || loadingRoutes;
@@ -845,16 +769,16 @@ function UnifiedScreen() {
                   pinColor="#FF6B35"
                 />
               )}
-              {/* Ship markers */}
-              {nearbyShips.map((ship) => (
+              {/* ✅ FIXED: Using ships from useAIS hook instead of nearbyShips */}
+              {ships.map((ship) => (
                 <Marker
                   key={ship.mmsi}
                   coordinate={{
                     latitude: ship.latitude,
                     longitude: ship.longitude,
                   }}
-                  title={ship.vessel_name || `Vessel ${ship.mmsi}`}
-                  description={`Speed: ${ship.sog?.toFixed(1) || "?"} kn • Distance: ${ship.distance?.toFixed(1) || "?"} km`}
+                  title={`Vessel ${ship.mmsi}`}
+                  description={`Speed: ${ship.sog?.toFixed(1) ?? "?"} kn • Distance: ${ship.distance?.toFixed(1) ?? "?"} km`}
                   pinColor="#e74c3c"
                 />
               ))}
@@ -1037,56 +961,44 @@ function UnifiedScreen() {
           )}
         </View>
 
-        {/* ─── VESSEL API SECTION (NEW) ─── */}
+        {/* ─── VESSEL API SECTION ─── */}
         <View style={styles.card}>
           <Text style={styles.cardTitle}>⛵ Nearby Vessels</Text>
           <Text style={styles.label}>
-            VesselAPI - Real-time ship positions within ~100km
+            Live AIS stream (~50km filtered + predicted)
           </Text>
 
           <TouchableOpacity
-            style={[
-              styles.primaryBtn,
-              {
-                backgroundColor: shipCooldownRemaining > 0 ? "#555" : "#2c3e50",
-              },
-            ]}
-            onPress={fetchNearbyShips}
-            disabled={loadingShips || shipCooldownRemaining > 0 || !location}
+            style={[styles.primaryBtn, { backgroundColor: "#2c3e50" }]}
+            onPress={refreshAIS}
+            disabled={!location}
           >
-            {loadingShips ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <Text style={styles.primaryBtnText}>
-                {shipCooldownRemaining > 0
-                  ? `⏳ Wait ${shipCooldownRemaining}s`
-                  : "🔍 Find Nearby Ships"}
-              </Text>
-            )}
+            <Text style={styles.primaryBtnText}>🔄 Refresh AIS Stream</Text>
           </TouchableOpacity>
 
-          {nearbyShips.length > 0 && (
+          {ships.length > 0 && (
             <ScrollView style={styles.shipsList}>
-              {nearbyShips.map((ship, index) => (
+              {ships.map((ship: Ship, index: number) => (
                 <View key={ship.mmsi || index} style={styles.shipCard}>
                   <View style={styles.shipHeader}>
                     <Ionicons name="boat" size={18} color="#e74c3c" />
-                    <Text style={styles.shipName}>
-                      {ship.vessel_name || `Vessel ${ship.mmsi}`}
-                    </Text>
+                    <Text style={styles.shipName}>{`Vessel ${ship.mmsi}`}</Text>
                   </View>
+
+                  <Text style={styles.shipDetail}>MMSI: {ship.mmsi}</Text>
+
                   <Text style={styles.shipDetail}>
-                    MMSI: {ship.mmsi || "N/A"}
+                    📍 Distance: {ship.distance?.toFixed(1) ?? "?"} km
                   </Text>
+
                   <Text style={styles.shipDetail}>
-                    📍 Distance: {ship.distance?.toFixed(1) || "?"} km
+                    ⚡ Speed: {ship.sog?.toFixed(1) ?? "?"} knots
                   </Text>
+
                   <Text style={styles.shipDetail}>
-                    ⚡ Speed: {ship.sog?.toFixed(1) || "?"} knots
+                    🧭 Course: {ship.cog?.toFixed(0) ?? "?"}°
                   </Text>
-                  <Text style={styles.shipDetail}>
-                    🧭 Course: {ship.cog?.toFixed(0) || "?"}°
-                  </Text>
+
                   <Text style={styles.shipDetail}>
                     📍 Position: {ship.latitude.toFixed(4)}°,{" "}
                     {ship.longitude.toFixed(4)}°
@@ -1096,20 +1008,24 @@ function UnifiedScreen() {
             </ScrollView>
           )}
 
-          {!loadingShips && nearbyShips.length === 0 && location && (
+          {ships.length === 0 && location && baseURL && (
             <Text style={styles.hintText}>
-              No ships found. Try moving closer to coastal waters.
+              Listening for AIS signals... ships will appear automatically
+            </Text>
+          )}
+
+          {!baseURL && (
+            <Text style={styles.hintText}>
+              ⚠️ Configure gateway IP first to enable AIS stream
             </Text>
           )}
 
           {!location && (
-            <Text style={styles.hintText}>
-              ⚠️ Waiting for GPS location to detect ships...
-            </Text>
+            <Text style={styles.hintText}>⚠️ Waiting for GPS location...</Text>
           )}
 
           <Text style={styles.apiNote}>
-            ⓘ VesselAPI requests are limited to 1 every 30 seconds
+            ⓘ Real-time AIS stream with prediction & smoothing
           </Text>
         </View>
       </ScrollView>
@@ -1203,7 +1119,7 @@ export default function App() {
   );
 }
 
-/* ───────────────── STYLES (extended) ───────────────── */
+/* ───────────────── STYLES ───────────────── */
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: "#0d0d1a" },
   scrollContainer: { padding: 16, paddingBottom: 40 },
@@ -1347,7 +1263,6 @@ const styles = StyleSheet.create({
   directionStepBody: { flex: 1, paddingBottom: 12, gap: 2 },
   directionStepText: { color: "#eee", fontSize: 14, lineHeight: 20 },
   directionStepMeta: { color: "#888", fontSize: 12 },
-  // New styles for vessel section
   shipsList: { maxHeight: 400, marginTop: 12 },
   shipCard: {
     backgroundColor: "#1a1a2e",

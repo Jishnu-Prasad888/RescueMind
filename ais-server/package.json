@@ -10,6 +10,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "ioredis": "^5.10.1",
     "ws": "^8.20.0"
   }
 }
