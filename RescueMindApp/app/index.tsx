@@ -563,67 +563,83 @@ function UnifiedScreen() {
     setLoadingShips(true);
 
     const delta = 0.9;
-    const latBottom = location.latitude - delta;
-    const latTop = location.latitude + delta;
-    const lonLeft = location.longitude - delta;
-    const lonRight = location.longitude + delta;
+    const maxSteps = 5; // how far west you want to scan
+
+    let foundShips: NearbyShip[] = [];
 
     try {
-      const url = `https://api.vesselapi.com/v1/location/vessels/bounding-box?filter.lonLeft=${lonLeft}&filter.lonRight=${lonRight}&filter.latBottom=${latBottom}&filter.latTop=${latTop}&pagination.limit=20`;
+      for (let step = 0; step < maxSteps; step++) {
+        // shift WEST → longitude decreases
+        const shiftedLon = location.longitude - step * (2 * delta);
 
-      const response: Response = await fetch(url, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${VESSEL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      });
+        const latBottom = location.latitude - delta;
+        const latTop = location.latitude + delta;
+        const lonLeft = shiftedLon - delta;
+        const lonRight = shiftedLon + delta;
 
-      const text: string = await response.text();
+        const url = `https://api.vesselapi.com/v1/location/vessels/bounding-box?filter.lonLeft=${lonLeft}&filter.lonRight=${lonRight}&filter.latBottom=${latBottom}&filter.latTop=${latTop}&pagination.limit=20`;
 
-      if (!response.ok) {
-        throw new Error(`API ${response.status}: ${text}`);
+        console.log(`Scanning step ${step} (west)...`);
+
+        const response: Response = await fetch(url, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${VESSEL_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+        });
+
+        const text: string = await response.text();
+
+        if (!response.ok) {
+          throw new Error(`API ${response.status}: ${text}`);
+        }
+
+        const data: VesselApiResponse = JSON.parse(text);
+        const vessels: NearbyShip[] = data.vessels ?? [];
+
+        if (vessels.length > 0) {
+          foundShips = vessels;
+          console.log(`Ships found at step ${step}`);
+          break; // stop scanning
+        }
+
+        // ⚠️ respect API rate limit
+        if (step < maxSteps - 1) {
+          await new Promise((res) => setTimeout(res, 31000)); // 31 sec delay
+        }
       }
 
-      const data: VesselApiResponse = JSON.parse(text);
+      if (foundShips.length === 0) {
+        Alert.alert("No Ships Found", "Scanned west but no vessels found.");
+        setNearbyShips([]);
+        return;
+      }
 
-      const vessels: NearbyShip[] = data.vessels ?? [];
-
-      const sortedShips: NearbyShip[] = vessels
-        .map(
-          (ship: NearbyShip): NearbyShip => ({
-            ...ship,
-            distance:
-              Math.sqrt(
-                Math.pow(ship.latitude - location.latitude, 2) +
-                  Math.pow(ship.longitude - location.longitude, 2),
-              ) * 111,
-          }),
-        )
-        .sort(
-          (a: NearbyShip, b: NearbyShip): number =>
-            (a.distance ?? Infinity) - (b.distance ?? Infinity),
-        )
+      // sort based on ORIGINAL location
+      const sortedShips: NearbyShip[] = foundShips
+        .map((ship) => ({
+          ...ship,
+          distance:
+            Math.sqrt(
+              Math.pow(ship.latitude - location.latitude, 2) +
+                Math.pow(ship.longitude - location.longitude, 2),
+            ) * 111,
+        }))
+        .sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity))
         .slice(0, 10);
 
       setNearbyShips(sortedShips);
-      setLastShipFetchTime(now);
+      setLastShipFetchTime(Date.now());
       setShipCooldownRemaining(30);
-
-      if (sortedShips.length === 0) {
-        Alert.alert("No Ships Found", "No vessels nearby.");
-      }
     } catch (error: unknown) {
       console.error("Vessel API error:", error);
-
       const message = error instanceof Error ? error.message : "Unknown error";
-
       Alert.alert("Vessel API Error", message);
     } finally {
       setLoadingShips(false);
     }
   }, [location, lastShipFetchTime]);
-
   const dot = (val: boolean | null) =>
     val === null ? "⚪" : val ? "🟢" : "🔴";
   const isLoading = loadingNearest || loadingRoutes;
