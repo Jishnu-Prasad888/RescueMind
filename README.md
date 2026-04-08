@@ -84,6 +84,15 @@ Now frontend can use one base URL:
 
 `http://localhost:6000`
 
+nearby ships location
+
+cd ais-server
+npm instal
+docker run -d -p 6379:6379 redis
+node index.js
+
+
+
 ## Unified Gateway API
 
 ### Local nearest location endpoint
