@@ -38,6 +38,11 @@ import MapView, {
 } from "react-native-maps";
 import { Ionicons } from "@expo/vector-icons";
 
+// HARDCODED VESSEL API KEY (replace with your actual key)
+const VESSEL_API_KEY =
+  "7094163eced8d77aff8754208329f0fe11eb1414d9d885f43f88c1bdf931fe4f"; // Get free key from vesselapi.com
+const VESSEL_API_BASE = "https://api.vesselapi.com/v1"; // Replace with actual base URL from docs
+
 /* ───────────────── TYPES ───────────────── */
 type Coord = { latitude: number; longitude: number };
 type Step = {
@@ -81,6 +86,22 @@ type AppContextType = {
   checking: boolean;
   checkHealth: (ip?: string) => void;
   location: Coord | null;
+};
+
+type NearbyShip = {
+  mmsi: number;
+  vessel_name?: string;
+  vesselName?: string;
+  latitude: number;
+  longitude: number;
+  sog?: number;
+  cog?: number;
+  distance?: number;
+  [key: string]: unknown;
+};
+
+type VesselApiResponse = {
+  vessels?: NearbyShip[];
 };
 
 /* ───────────────── CONTEXT ───────────────── */
@@ -347,6 +368,15 @@ function UnifiedScreen() {
   const [loadingRoutes, setLoadingRoutes] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Vessel API state
+  const [nearbyShips, setNearbyShips] = useState<NearbyShip[]>([]);
+  const [loadingShips, setLoadingShips] = useState(false);
+  const [lastShipFetchTime, setLastShipFetchTime] = useState<number>(0);
+  const [shipCooldownRemaining, setShipCooldownRemaining] = useState(0);
+  const shipCooldownInterval = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+
   const selectedRoute =
     routes.find((r) => r.type === selectedType) ?? routes[0] ?? null;
   const turnByTurn = useMemo(() => {
@@ -372,6 +402,40 @@ function UnifiedScreen() {
       animated: true,
     });
   }, [selectedType, routes]);
+
+  // Cleanup cooldown interval
+  useEffect(() => {
+    return () => {
+      if (shipCooldownInterval.current) {
+        clearInterval(shipCooldownInterval.current);
+      }
+    };
+  }, []);
+
+  // Update cooldown timer
+  useEffect(() => {
+    if (shipCooldownRemaining > 0) {
+      if (shipCooldownInterval.current) {
+        clearInterval(shipCooldownInterval.current);
+      }
+      shipCooldownInterval.current = setInterval(() => {
+        setShipCooldownRemaining((prev) => {
+          if (prev <= 1) {
+            if (shipCooldownInterval.current) {
+              clearInterval(shipCooldownInterval.current);
+            }
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (shipCooldownInterval.current) {
+        clearInterval(shipCooldownInterval.current);
+      }
+    };
+  }, [shipCooldownRemaining]);
 
   const fetchNearest = useCallback(async () => {
     if (!location || !baseURL) {
@@ -474,6 +538,91 @@ function UnifiedScreen() {
       );
     }
   };
+
+  // Fetch nearby ships from Vessel API
+  const fetchNearbyShips = useCallback(async (): Promise<void> => {
+    if (!location) {
+      Alert.alert("Location Error", "Current location not available.");
+      return;
+    }
+
+    if (!VESSEL_API_KEY) {
+      Alert.alert("Config Error", "Missing Vessel API Key");
+      return;
+    }
+
+    const now = Date.now();
+    const timeSinceLastFetch = now - lastShipFetchTime;
+
+    if (timeSinceLastFetch < 30000) {
+      const remaining = Math.ceil((30000 - timeSinceLastFetch) / 1000);
+      Alert.alert("Rate Limited", `Wait ${remaining}s`);
+      return;
+    }
+
+    setLoadingShips(true);
+
+    const delta = 0.9;
+    const latBottom = location.latitude - delta;
+    const latTop = location.latitude + delta;
+    const lonLeft = location.longitude - delta;
+    const lonRight = location.longitude + delta;
+
+    try {
+      const url = `https://api.vesselapi.com/v1/location/vessels/bounding-box?filter.lonLeft=${lonLeft}&filter.lonRight=${lonRight}&filter.latBottom=${latBottom}&filter.latTop=${latTop}&pagination.limit=20`;
+
+      const response: Response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${VESSEL_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      const text: string = await response.text();
+
+      if (!response.ok) {
+        throw new Error(`API ${response.status}: ${text}`);
+      }
+
+      const data: VesselApiResponse = JSON.parse(text);
+
+      const vessels: NearbyShip[] = data.vessels ?? [];
+
+      const sortedShips: NearbyShip[] = vessels
+        .map(
+          (ship: NearbyShip): NearbyShip => ({
+            ...ship,
+            distance:
+              Math.sqrt(
+                Math.pow(ship.latitude - location.latitude, 2) +
+                  Math.pow(ship.longitude - location.longitude, 2),
+              ) * 111,
+          }),
+        )
+        .sort(
+          (a: NearbyShip, b: NearbyShip): number =>
+            (a.distance ?? Infinity) - (b.distance ?? Infinity),
+        )
+        .slice(0, 10);
+
+      setNearbyShips(sortedShips);
+      setLastShipFetchTime(now);
+      setShipCooldownRemaining(30);
+
+      if (sortedShips.length === 0) {
+        Alert.alert("No Ships Found", "No vessels nearby.");
+      }
+    } catch (error: unknown) {
+      console.error("Vessel API error:", error);
+
+      const message = error instanceof Error ? error.message : "Unknown error";
+
+      Alert.alert("Vessel API Error", message);
+    } finally {
+      setLoadingShips(false);
+    }
+  }, [location, lastShipFetchTime]);
 
   const dot = (val: boolean | null) =>
     val === null ? "⚪" : val ? "🟢" : "🔴";
@@ -635,6 +784,19 @@ function UnifiedScreen() {
                   pinColor="#FF6B35"
                 />
               )}
+              {/* Ship markers */}
+              {nearbyShips.map((ship) => (
+                <Marker
+                  key={ship.mmsi}
+                  coordinate={{
+                    latitude: ship.latitude,
+                    longitude: ship.longitude,
+                  }}
+                  title={ship.vessel_name || `Vessel ${ship.mmsi}`}
+                  description={`Speed: ${ship.sog?.toFixed(1) || "?"} kn • Distance: ${ship.distance?.toFixed(1) || "?"} km`}
+                  pinColor="#e74c3c"
+                />
+              ))}
             </MapView>
           </View>
 
@@ -812,6 +974,82 @@ function UnifiedScreen() {
           {!location && (
             <Text style={styles.hintText}>⚠️ Waiting for GPS location…</Text>
           )}
+        </View>
+
+        {/* ─── VESSEL API SECTION (NEW) ─── */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>⛵ Nearby Vessels</Text>
+          <Text style={styles.label}>
+            VesselAPI - Real-time ship positions within ~100km
+          </Text>
+
+          <TouchableOpacity
+            style={[
+              styles.primaryBtn,
+              {
+                backgroundColor: shipCooldownRemaining > 0 ? "#555" : "#2c3e50",
+              },
+            ]}
+            onPress={fetchNearbyShips}
+            disabled={loadingShips || shipCooldownRemaining > 0 || !location}
+          >
+            {loadingShips ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.primaryBtnText}>
+                {shipCooldownRemaining > 0
+                  ? `⏳ Wait ${shipCooldownRemaining}s`
+                  : "🔍 Find Nearby Ships"}
+              </Text>
+            )}
+          </TouchableOpacity>
+
+          {nearbyShips.length > 0 && (
+            <ScrollView style={styles.shipsList}>
+              {nearbyShips.map((ship, index) => (
+                <View key={ship.mmsi || index} style={styles.shipCard}>
+                  <View style={styles.shipHeader}>
+                    <Ionicons name="boat" size={18} color="#e74c3c" />
+                    <Text style={styles.shipName}>
+                      {ship.vessel_name || `Vessel ${ship.mmsi}`}
+                    </Text>
+                  </View>
+                  <Text style={styles.shipDetail}>
+                    MMSI: {ship.mmsi || "N/A"}
+                  </Text>
+                  <Text style={styles.shipDetail}>
+                    📍 Distance: {ship.distance?.toFixed(1) || "?"} km
+                  </Text>
+                  <Text style={styles.shipDetail}>
+                    ⚡ Speed: {ship.sog?.toFixed(1) || "?"} knots
+                  </Text>
+                  <Text style={styles.shipDetail}>
+                    🧭 Course: {ship.cog?.toFixed(0) || "?"}°
+                  </Text>
+                  <Text style={styles.shipDetail}>
+                    📍 Position: {ship.latitude.toFixed(4)}°,{" "}
+                    {ship.longitude.toFixed(4)}°
+                  </Text>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+
+          {!loadingShips && nearbyShips.length === 0 && location && (
+            <Text style={styles.hintText}>
+              No ships found. Try moving closer to coastal waters.
+            </Text>
+          )}
+
+          {!location && (
+            <Text style={styles.hintText}>
+              ⚠️ Waiting for GPS location to detect ships...
+            </Text>
+          )}
+
+          <Text style={styles.apiNote}>
+            ⓘ VesselAPI requests are limited to 1 every 30 seconds
+          </Text>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -1048,4 +1286,37 @@ const styles = StyleSheet.create({
   directionStepBody: { flex: 1, paddingBottom: 12, gap: 2 },
   directionStepText: { color: "#eee", fontSize: 14, lineHeight: 20 },
   directionStepMeta: { color: "#888", fontSize: 12 },
+  // New styles for vessel section
+  shipsList: { maxHeight: 400, marginTop: 12 },
+  shipCard: {
+    backgroundColor: "#1a1a2e",
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: "#e74c3c",
+  },
+  shipHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 8,
+  },
+  shipName: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 15,
+    flex: 1,
+  },
+  shipDetail: {
+    color: "#aaa",
+    fontSize: 12,
+    marginTop: 2,
+  },
+  apiNote: {
+    color: "#555",
+    fontSize: 11,
+    textAlign: "center",
+    marginTop: 12,
+  },
 });
