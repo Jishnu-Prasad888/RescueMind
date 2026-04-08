@@ -42,7 +42,7 @@ import { Ionicons } from "@expo/vector-icons";
 const VESSEL_API_KEY =
   "7094163eced8d77aff8754208329f0fe11eb1414d9d885f43f88c1bdf931fe4f"; // Get free key from vesselapi.com
 const VESSEL_API_BASE = "https://api.vesselapi.com/v1"; // Replace with actual base URL from docs
-
+const AIS_STREAM_API_KEY = "f7e0f030d50fc2b5a717e0d0c88b898409fbd71f";
 /* ───────────────── TYPES ───────────────── */
 type Coord = { latitude: number; longitude: number };
 type Step = {
@@ -96,7 +96,7 @@ type NearbyShip = {
   longitude: number;
   sog?: number;
   cog?: number;
-  distance?: number;
+  distance: number;
   [key: string]: unknown;
 };
 
@@ -358,6 +358,8 @@ function UnifiedScreen() {
   const [ragLoading, setRagLoading] = useState(false);
   const ragScrollRef = useRef<ScrollView>(null);
 
+  const [scanStep, setScanStep] = useState(0);
+
   // Navigation state
   const mapRef = useRef<MapView>(null);
   const [nearest, setNearest] = useState<NearestLocation | null>(null);
@@ -540,106 +542,149 @@ function UnifiedScreen() {
   };
 
   // Fetch nearby ships from Vessel API
-  const fetchNearbyShips = useCallback(async (): Promise<void> => {
+  const fetchNearbyShips = useCallback(() => {
     if (!location) {
-      Alert.alert("Location Error", "Current location not available.");
+      console.error("❌ No location available");
       return;
     }
 
-    if (!VESSEL_API_KEY) {
-      Alert.alert("Config Error", "Missing Vessel API Key");
+    if (!AIS_STREAM_API_KEY) {
+      console.error("❌ Missing AIS API Key");
       return;
     }
 
-    const now = Date.now();
-    const timeSinceLastFetch = now - lastShipFetchTime;
-
-    if (timeSinceLastFetch < 30000) {
-      const remaining = Math.ceil((30000 - timeSinceLastFetch) / 1000);
-      Alert.alert("Rate Limited", `Wait ${remaining}s`);
-      return;
-    }
+    console.log("🚀 Starting AIS scan...");
+    console.log("🔑 AIS KEY:", AIS_STREAM_API_KEY);
 
     setLoadingShips(true);
 
     const delta = 0.9;
-    const maxSteps = 5; // how far west you want to scan
+    const currentStep = scanStep;
 
-    let foundShips: NearbyShip[] = [];
+    const shiftedLon = location.longitude - currentStep * (2 * delta);
 
-    try {
-      for (let step = 0; step < maxSteps; step++) {
-        // shift WEST → longitude decreases
-        const shiftedLon = location.longitude - step * (2 * delta);
+    const latBottom = location.latitude - delta;
+    const latTop = location.latitude + delta;
+    const lonLeft = shiftedLon - delta;
+    const lonRight = shiftedLon + delta;
 
-        const latBottom = location.latitude - delta;
-        const latTop = location.latitude + delta;
-        const lonLeft = shiftedLon - delta;
-        const lonRight = shiftedLon + delta;
+    console.log("📦 Bounding Box:", {
+      latBottom,
+      latTop,
+      lonLeft,
+      lonRight,
+      step: currentStep,
+    });
 
-        const url = `https://api.vesselapi.com/v1/location/vessels/bounding-box?filter.lonLeft=${lonLeft}&filter.lonRight=${lonRight}&filter.latBottom=${latBottom}&filter.latTop=${latTop}&pagination.limit=20`;
+    const socket = new WebSocket("ws://10.205.183.108:6969");
 
-        console.log(`Scanning step ${step} (west)...`);
+    let shipsMap = new Map<number, NearbyShip>();
+    let hasReceivedData = false;
 
-        const response: Response = await fetch(url, {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${VESSEL_API_KEY}`,
-            "Content-Type": "application/json",
-          },
+    socket.onopen = () => {
+      console.log("✅ WS OPEN");
+
+      const subMessage = {
+        APIKey: AIS_STREAM_API_KEY,
+        BoundingBoxes: [
+          [
+            [latBottom, lonLeft],
+            [latTop, lonRight],
+          ],
+        ],
+      };
+
+      console.log("📤 Sending subscription:", subMessage);
+
+      socket.send(JSON.stringify(subMessage));
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data?.Message?.PositionReport) {
+          hasReceivedData = true;
+
+          const msg = data.Message.PositionReport;
+
+          if (
+            msg?.Latitude == null ||
+            msg?.Longitude == null ||
+            msg?.UserID == null
+          ) {
+            return;
+          }
+
+          const mmsi = msg.UserID;
+
+          const distance =
+            haversineM(
+              {
+                latitude: location.latitude,
+                longitude: location.longitude,
+              },
+              {
+                latitude: msg.Latitude,
+                longitude: msg.Longitude,
+              },
+            ) / 1000;
+
+          shipsMap.set(mmsi, {
+            mmsi,
+            latitude: msg.Latitude,
+            longitude: msg.Longitude,
+            sog: msg.Sog,
+            cog: msg.Cog,
+            distance, // ✅ always defined
+          });
+
+          const sorted = Array.from(shipsMap.values())
+            .sort((a, b) => a.distance - b.distance)
+            .slice(0, 10);
+
+          console.log(`🚢 Ships tracked: ${sorted.length}`);
+
+          setNearbyShips(sorted);
+        }
+      } catch (err) {
+        console.error("❌ WS PARSE ERROR:", err);
+      }
+    };
+
+    socket.onerror = (err) => {
+      console.error("❌ WS ERROR:", JSON.stringify(err, null, 2));
+    };
+
+    socket.onclose = (event) => {
+      console.log("🔌 WS CLOSED:", {
+        code: event.code,
+        reason: event.reason,
+        clean: event.wasClean,
+      });
+
+      if (!hasReceivedData || shipsMap.size === 0) {
+        setScanStep((prev) => {
+          const next = prev + 1;
+          console.log(`🔍 No ships → scanning step ${next}`);
+          return next;
         });
-
-        const text: string = await response.text();
-
-        if (!response.ok) {
-          throw new Error(`API ${response.status}: ${text}`);
-        }
-
-        const data: VesselApiResponse = JSON.parse(text);
-        const vessels: NearbyShip[] = data.vessels ?? [];
-
-        if (vessels.length > 0) {
-          foundShips = vessels;
-          console.log(`Ships found at step ${step}`);
-          break; // stop scanning
-        }
-
-        // ⚠️ respect API rate limit
-        if (step < maxSteps - 1) {
-          await new Promise((res) => setTimeout(res, 31000)); // 31 sec delay
-        }
+      } else {
+        console.log("✅ Ships found, resetting scan");
+        setScanStep(0);
       }
 
-      if (foundShips.length === 0) {
-        Alert.alert("No Ships Found", "Scanned west but no vessels found.");
-        setNearbyShips([]);
-        return;
-      }
-
-      // sort based on ORIGINAL location
-      const sortedShips: NearbyShip[] = foundShips
-        .map((ship) => ({
-          ...ship,
-          distance:
-            Math.sqrt(
-              Math.pow(ship.latitude - location.latitude, 2) +
-                Math.pow(ship.longitude - location.longitude, 2),
-            ) * 111,
-        }))
-        .sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity))
-        .slice(0, 10);
-
-      setNearbyShips(sortedShips);
-      setLastShipFetchTime(Date.now());
-      setShipCooldownRemaining(30);
-    } catch (error: unknown) {
-      console.error("Vessel API error:", error);
-      const message = error instanceof Error ? error.message : "Unknown error";
-      Alert.alert("Vessel API Error", message);
-    } finally {
       setLoadingShips(false);
-    }
-  }, [location, lastShipFetchTime]);
+    };
+
+    // ⏱ auto close after 5 sec
+    setTimeout(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        console.log("⏱ Closing WS after timeout");
+        socket.close();
+      }
+    }, 5000);
+  }, [location, scanStep]);
   const dot = (val: boolean | null) =>
     val === null ? "⚪" : val ? "🟢" : "🔴";
   const isLoading = loadingNearest || loadingRoutes;
